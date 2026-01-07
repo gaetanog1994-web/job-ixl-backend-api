@@ -1,5 +1,6 @@
 import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
+import type { Request, Response, NextFunction } from "express";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -23,7 +24,7 @@ export const syncGraphRouter = Router();
  * - backend-api costruisce dataset da Supabase (source of truth)
  * - graph-engine esegue build-graph (token-only)
  */
-syncGraphRouter.post("/sync-graph", async (req, res) => {
+syncGraphRouter.post("/sync-graph", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
     try {
         // 1) Leggi applications (source of truth)

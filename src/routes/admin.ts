@@ -4,6 +4,7 @@ import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 
+
 export const adminRouter = Router();
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -148,7 +149,7 @@ adminRouter.post(
  * POST /api/admin/sync-graph
  * Rebuild completo del grafo Neo4j (on-demand, admin-only)
  */
-adminRouter.post("/sync-graph", async (req, res) => {
+adminRouter.post("/sync-graph", async (req: Request, res: Response) => {
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
@@ -259,7 +260,7 @@ adminRouter.post("/sync-graph", async (req, res) => {
 });
 
 
-adminRouter.post("/graph/summary", async (req, res) => {
+adminRouter.post("/graph/summary", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
 
     const resp = await fetch(new URL("/graph/summary", GRAPH_SERVICE_URL).toString(), {
@@ -272,7 +273,7 @@ adminRouter.post("/graph/summary", async (req, res) => {
 });
 
 
-adminRouter.post("/graph/chains", async (req, res) => {
+adminRouter.post("/graph/chains", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
 
     const resp = await fetch(new URL("/graph/chains", GRAPH_SERVICE_URL).toString(), {
@@ -286,7 +287,7 @@ adminRouter.post("/graph/chains", async (req, res) => {
 });
 
 
-adminRouter.post("/graph/warmup", async (req, res) => {
+adminRouter.post("/graph/warmup", async (req: Request, res: Response) => {
     const resp = await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
         method: "POST",
         headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
