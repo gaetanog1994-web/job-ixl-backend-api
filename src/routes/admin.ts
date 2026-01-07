@@ -36,7 +36,7 @@ adminRouter.post(
                     `
             select user_id, position_id, priority
             from test_scenario_applications
-            where test_scenario_id = $1
+            where scenario_id = $1
         `,
                     [scenarioId]
                 );
@@ -55,7 +55,7 @@ adminRouter.post(
             insert into applications (user_id, position_id, priority)
             select user_id, position_id, priority
             from test_scenario_applications
-            where test_scenario_id = $1
+            where scenario_id = $1
         `,
                     [scenarioId]
                 );
@@ -68,7 +68,7 @@ adminRouter.post(
                     where id in (
                         select distinct user_id
                         from test_scenario_applications
-                        where test_scenario_id = $1
+                        where scenario_id = $1
                     )
                 `,
                     [scenarioId]
