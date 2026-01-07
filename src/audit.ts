@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { pool } from "../src/db.js";
+import { pool } from "./db.js";
 import crypto from "crypto";
 
 export function correlation(req: Request, _res: Response, next: NextFunction) {
