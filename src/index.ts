@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-
+import type { Request, Response } from "express";
 import { requireAuth, requireAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
 import { adminRouter } from "./routes/admin.js";
@@ -15,10 +15,11 @@ const app = express();
 app.use(express.json());
 app.use(correlation);
 
+
 // CORS (prima delle route)
 app.use(
     cors({
-        origin: (origin, cb) => {
+        origin: (origin: string | undefined, cb: (err: Error | null, allow?: boolean) => void) => {
             const allow = (process.env.CORS_ALLOWLIST ?? "")
                 .split(",")
                 .map((s) => s.trim())
@@ -35,7 +36,7 @@ app.use(
 );
 
 // Health pubblico (no auth)
-app.get("/health", async (_req, res) => {
+app.get("/health", async (_req: express.Request, res: express.Response) => {
     try {
         await pool.query("select 1");
         return res.status(200).json({ ok: true });
@@ -64,7 +65,7 @@ app.listen(PORT, "0.0.0.0", () => {
 });
 
 if (process.env.NODE_ENV !== "production") {
-    app.post("/_debug/auth-check", async (req, res) => {
+    app.post("/_debug/auth-check", async (req: express.Request, res: express.Response) => {
         const authHeader = req.headers.authorization || "";
         const token = authHeader.startsWith("Bearer ") ? authHeader.slice(7) : null;
         if (!token) return res.status(400).json({ ok: false, error: "Missing Bearer" });

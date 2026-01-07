@@ -302,7 +302,8 @@ adminRouter.post("/graph/warmup", async (req: Request, res: Response) => {
  * POST /api/admin/users/reset-active
  * Setta active=false per tutti gli utenti (admin-only)
  */
-adminRouter.post("/users/reset-active", async (req, res) => {
+adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
+
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
