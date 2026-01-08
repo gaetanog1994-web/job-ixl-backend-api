@@ -176,20 +176,16 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         for (const u of users ?? []) {
             if (u.availability_status !== "available") continue;
             // Supabase join spesso torna array anche per 1:1
-            const pos = Array.isArray((u as any).positions)
-                ? (u as any).positions[0]
-                : (u as any).positions;
-
             const loc = Array.isArray((u as any).locations)
                 ? (u as any).locations[0]
                 : (u as any).locations;
 
-            if (!pos) continue;
             if (!loc) continue;
 
+            // ruolo: lo prendiamo da role_id + roles.name
+            const roleId = (u as any).role_id ?? "unknown";
+            const roleName = (u as any).roles?.name ?? "—";
 
-            // qui "pos" è il tuo "role/position" (id + role_name + location_id)
-            const role = pos;
 
 
             // serve position_id dell'utente
@@ -205,17 +201,18 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 };
             }
 
-            if (!byLocation[loc.id].roles[role.id]) {
-                byLocation[loc.id].roles[role.id] = {
-                    role_id: role.id,
-                    role_name: role.role_name,
+            if (!byLocation[loc.id].roles[roleId]) {
+                byLocation[loc.id].roles[roleId] = {
+                    role_id: roleId,
+                    role_name: roleName,
+
                     applied: false,
                     priority: null,
                     users: [],
                 };
             }
 
-            byLocation[loc.id].roles[role.id].users.push({
+            byLocation[loc.id].roles[roleId].users.push({
                 id: u.id,
                 full_name: u.full_name,
                 position_id: u.position_id,
@@ -223,11 +220,11 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
             // Replica FE: se questo utente è "relato" (from/to), allora applicazione attiva su quel role
             if (relatedUserIds.includes(u.id)) {
-                byLocation[loc.id].roles[role.id].applied = true;
+                byLocation[loc.id].roles[roleId].applied = true;
 
-                if (byLocation[loc.id].roles[role.id].priority == null) {
+                if (byLocation[loc.id].roles[roleId].priority == null) {
                     const p = positionPriorityMap[u.position_id];
-                    if (p != null) byLocation[loc.id].roles[role.id].priority = p;
+                    if (p != null) byLocation[loc.id].roles[roleId].priority = p;
                 }
             }
 
