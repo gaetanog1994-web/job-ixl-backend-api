@@ -3,6 +3,31 @@ import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin } from "../db.js";
 
 export const mapRouter = Router();
+// --- Simple in-memory cache (product-lite) ---
+type CacheEntry = { expiresAt: number; value: any };
+
+const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
+const mapCache = new Map<string, CacheEntry>();
+
+function cacheKey(params: { tokenUserId: string; viewerUserId: string; mode: string }) {
+    // include tokenUserId to avoid accidental cross-user leakage when viewerUserId omitted
+    return `map:v1:${params.tokenUserId}:${params.viewerUserId}:${params.mode}`;
+}
+
+function cacheGet(key: string) {
+    const hit = mapCache.get(key);
+    if (!hit) return null;
+    if (Date.now() > hit.expiresAt) {
+        mapCache.delete(key);
+        return null;
+    }
+    return hit.value;
+}
+
+function cacheSet(key: string, value: any) {
+    mapCache.set(key, { value, expiresAt: Date.now() + MAP_CACHE_TTL_MS });
+}
+
 
 /**
  * GET /api/map/positions
@@ -22,6 +47,13 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         await new Promise<void>((resolve, reject) => {
             requireAdmin(r, res, (err?: any) => (err ? reject(err) : resolve()));
         });
+    }
+
+    // ✅ Cache (solo dopo enforcement admin)
+    const key = cacheKey({ tokenUserId, viewerUserId, mode });
+    const cached = cacheGet(key);
+    if (cached) {
+        return res.json(cached);
     }
 
     try {
@@ -256,7 +288,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         const lat = meLocObj?.latitude;
         const lng = meLocObj?.longitude;
 
-        res.json({
+        const payload = {
             viewerUserId,
             myStatus:
                 (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
@@ -266,7 +298,11 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             maxApplications: config.max_applications,
             usedPriorities: Array.from(new Set(usedPriorities)),
             locations,
-        });
+        };
+
+        cacheSet(key, payload);
+        return res.json(payload);
+
     } catch (err: any) {
         console.error("❌ map/positions error", err);
         res.status(500).json({ error: "MAP_POSITIONS_FAILED" });
