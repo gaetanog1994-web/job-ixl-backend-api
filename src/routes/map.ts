@@ -12,15 +12,13 @@ export const mapRouter = Router();
  */
 mapRouter.get("/positions", requireAuth, async (req, res) => {
     const r = req as AuthedRequest;
+
     const tokenUserId = r.user.id;
     const viewerUserId = (req.query.viewerUserId as string) || tokenUserId;
     const mode = (req.query.mode as string) === "to" ? "to" : "from";
 
-
     // 🔐 Admin enforcement (se provo a vedere un altro user)
     if (viewerUserId !== tokenUserId) {
-        // requireAdmin è un middleware express (req,res,next)
-        // lo invochiamo “inline” passando next finto che lancia
         await new Promise<void>((resolve, reject) => {
             requireAdmin(r, res, (err?: any) => (err ? reject(err) : resolve()));
         });
@@ -34,26 +32,25 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             .single();
         if (configErr) throw configErr;
 
-        // 2) viewer user (status + coords)
+        // 2) viewer user (status + coords via locations)
         const { data: me, error: meErr } = await supabaseAdmin
             .from("users")
             .select(
                 `
-    id,
-    availability_status,
-    location_id,
-    locations:location_id (
-      latitude,
-      longitude
-    )
-  `
+        id,
+        availability_status,
+        location_id,
+        locations:location_id (
+          latitude,
+          longitude
+        )
+      `
             )
             .eq("id", viewerUserId)
             .single();
         if (meErr) throw meErr;
 
-
-        // 3) applications del viewer (per usedPriorities e applied)
+        // 3) applications del viewer (per usedPriorities)
         const { data: myApplications, error: appsErr } = await supabaseAdmin
             .from("applications")
             .select("position_id, priority")
@@ -64,95 +61,114 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             .map((a: { priority: number | null }) => a.priority)
             .filter((p: number | null): p is number => p != null);
 
-
-        // 3b) RELAZIONI (replica PositionsMap: mode from/to)
+        /**
+         * 3b) RELAZIONI from/to
+         * - relatedUserIds: gli utenti da marcare come "applied" sulla mappa
+         * - userPriorityMap: priorità da mostrare accanto al pallino rosso (per quell'utente)
+         */
         let relatedUserIds: string[] = [];
-        const positionPriorityMap: Record<string, number> = {};
+        const userPriorityMap: Record<string, number> = {};
 
         if (mode === "from") {
             // io → posizioni a cui mi candido → occupanti di quelle posizioni
             const { data: apps, error } = await supabaseAdmin
                 .from("applications")
-                .select(`
-      priority,
-      positions (
-        id,
-        occupied_by
-      )
-    `)
+                .select(
+                    `
+          position_id,
+          priority,
+          positions (
+            occupied_by
+          )
+        `
+                )
                 .eq("user_id", viewerUserId);
 
             if (error) throw error;
 
-            relatedUserIds =
-                (apps ?? [])
-                    .map((a: any) => {
-                        const pos = Array.isArray(a.positions) ? a.positions[0] : a.positions;
-                        return pos?.occupied_by;
-                    })
-                    .filter(Boolean);
+            for (const a of apps ?? []) {
+                const pos = Array.isArray((a as any).positions) ? (a as any).positions[0] : (a as any).positions;
+                const occ = pos?.occupied_by;
+                if (!occ) continue;
 
-            (apps ?? []).forEach((a: any) => {
-                const pos = Array.isArray(a.positions) ? a.positions[0] : a.positions;
-                if (pos?.id && a.priority != null) {
-                    positionPriorityMap[pos.id] = a.priority;
+                relatedUserIds.push(occ);
+
+                // mettiamo la priorità migliore (min)
+                if (a.priority != null) {
+                    const prev = userPriorityMap[occ];
+                    userPriorityMap[occ] = prev == null ? a.priority : Math.min(prev, a.priority);
                 }
-            });
-
-
+            }
         } else {
             // altri → mie posizioni (positions.occupied_by = me)
-            const { data: apps, error } = await supabaseAdmin
-                .from("applications")
-                .select(`
-      user_id,
-      priority,
-      positions!inner (
-        id,
-        occupied_by
-      )
-    `)
-                .eq("positions.occupied_by", viewerUserId);
+            // 1) trovo le mie posizioni
+            const { data: myPos, error: myPosErr } = await supabaseAdmin
+                .from("positions")
+                .select("id")
+                .eq("occupied_by", viewerUserId);
 
-            if (error) throw error;
+            if (myPosErr) throw myPosErr;
 
-            relatedUserIds = (apps ?? []).map((a: any) => a.user_id).filter(Boolean);
+            const myPosIds = (myPos ?? []).map((p: any) => p.id).filter(Boolean);
 
-            (apps ?? []).forEach((a: any) => {
-                const pos = Array.isArray(a.positions) ? a.positions[0] : a.positions;
-                if (pos?.id && a.priority != null) {
-                    positionPriorityMap[pos.id] = a.priority;
+            if (myPosIds.length > 0) {
+                // 2) prendo le applications verso le mie posizioni
+                const { data: apps, error } = await supabaseAdmin
+                    .from("applications")
+                    .select("user_id, position_id, priority")
+                    .in("position_id", myPosIds);
+
+                if (error) throw error;
+
+                for (const a of apps ?? []) {
+                    if (!a.user_id) continue;
+                    relatedUserIds.push(a.user_id);
+
+                    if (a.priority != null) {
+                        const prev = userPriorityMap[a.user_id];
+                        userPriorityMap[a.user_id] = prev == null ? a.priority : Math.min(prev, a.priority);
+                    }
                 }
-            });
-
+            }
         }
 
+        // dedup
+        relatedUserIds = Array.from(new Set(relatedUserIds));
 
-        // 4) users + join positions + locations
+        /**
+         * 4) USERS “mappabili”
+         * Serve:
+         * - role_id + roles.name
+         * - location_id + locations(lat/lng)
+         * - position_id = positions.id dove positions.occupied_by = users.id  ✅ (questa è la chiave!)
+         */
         const { data: users, error: usersErr } = await supabaseAdmin
             .from("users")
-            .select(`
-    id,
-    full_name,
-    availability_status,
-    position_id,
-    role_id,
-    roles:role_id (
-      name
-    ),
-    location_id,
-    locations:location_id (
-      id,
-      name,
-      latitude,
-      longitude
-    )
-  `);
+            .select(
+                `
+        id,
+        full_name,
+        availability_status,
+        role_id,
+        roles:role_id (
+          name
+        ),
+        location_id,
+        locations:location_id (
+          id,
+          name,
+          latitude,
+          longitude
+        ),
+        positions:positions!occupied_by (
+          id
+        )
+      `
+            );
 
         if (usersErr) throw usersErr;
 
-
-        // 5) aggregazione: byLocation -> roles -> users
+        // 5) aggregazione byLocation -> roles -> users
         const byLocation: Record<
             string,
             {
@@ -175,21 +191,18 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
         for (const u of users ?? []) {
             if (u.availability_status !== "available") continue;
-            // Supabase join spesso torna array anche per 1:1
-            const loc = Array.isArray((u as any).locations)
-                ? (u as any).locations[0]
-                : (u as any).locations;
 
+            const loc = Array.isArray((u as any).locations) ? (u as any).locations[0] : (u as any).locations;
             if (!loc) continue;
 
-            // ruolo: lo prendiamo da role_id + roles.name
             const roleId = (u as any).role_id ?? "unknown";
             const roleName = (u as any).roles?.name ?? "—";
 
-
-
-            // serve position_id dell'utente
-            if (!u.position_id) continue;
+            // posizione “occupata” dell’utente = positions.id (via FK positions.occupied_by)
+            const posArr = (u as any).positions;
+            const posObj = Array.isArray(posArr) ? posArr[0] : posArr;
+            const positionId = posObj?.id;
+            if (!positionId) continue; // senza positionId non posso candidarmi a lui
 
             if (!byLocation[loc.id]) {
                 byLocation[loc.id] = {
@@ -205,7 +218,6 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 byLocation[loc.id].roles[roleId] = {
                     role_id: roleId,
                     role_name: roleName,
-
                     applied: false,
                     priority: null,
                     users: [],
@@ -215,19 +227,15 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             byLocation[loc.id].roles[roleId].users.push({
                 id: u.id,
                 full_name: u.full_name,
-                position_id: u.position_id,
+                position_id: positionId, // ✅ ADESSO è positions.id (corretto)
             });
 
-            // Replica FE: se questo utente è "relato" (from/to), allora applicazione attiva su quel role
+            // applied/priority coerenti col mode
             if (relatedUserIds.includes(u.id)) {
                 byLocation[loc.id].roles[roleId].applied = true;
-
-                if (byLocation[loc.id].roles[roleId].priority == null) {
-                    const p = positionPriorityMap[u.position_id];
-                    if (p != null) byLocation[loc.id].roles[roleId].priority = p;
-                }
+                const p = userPriorityMap[u.id];
+                if (p != null) byLocation[loc.id].roles[roleId].priority = p;
             }
-
         }
 
         const locations = Object.values(byLocation).map((loc) => ({
@@ -235,14 +243,11 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             roles: Object.values(loc.roles),
         }));
 
+        // viewer marker
         const OFFSET = 0.002;
-
-        const locObj = Array.isArray((me as any).locations)
-            ? (me as any).locations[0]
-            : (me as any).locations;
-
-        const lat = locObj?.latitude;
-        const lng = locObj?.longitude;
+        const meLocObj = Array.isArray((me as any).locations) ? (me as any).locations[0] : (me as any).locations;
+        const lat = meLocObj?.latitude;
+        const lng = meLocObj?.longitude;
 
         res.json({
             viewerUserId,
@@ -250,15 +255,11 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
                     ? "available"
                     : "inactive",
-            meLocation:
-                lat != null && lng != null
-                    ? { latitude: lat + OFFSET, longitude: lng + OFFSET }
-                    : null,
+            meLocation: lat != null && lng != null ? { latitude: lat + OFFSET, longitude: lng + OFFSET } : null,
             maxApplications: config.max_applications,
             usedPriorities: Array.from(new Set(usedPriorities)),
             locations,
         });
-
     } catch (err: any) {
         console.error("❌ map/positions error", err);
         res.status(500).json({ error: "MAP_POSITIONS_FAILED" });
