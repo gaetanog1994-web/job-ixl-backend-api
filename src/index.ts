@@ -9,9 +9,16 @@ import { adminRouter } from "./routes/admin.js";
 import { graphProxyRouter } from "./routes/graphProxy.js";
 import { pool } from "./db.js";
 import { syncGraphRouter } from "./routes/syncGraph.js";
+import { mapRouter } from "./routes/map.js";
+
 
 
 const app = express();
+app.set("trust proxy", 1);
+
+console.log("✅ BOOT BACKEND VERSION: MAP ROUTER ENABLED");
+
+
 app.use(express.json());
 app.use(correlation);
 
@@ -35,6 +42,9 @@ app.use(
     })
 );
 
+
+app.use("/api/map", mapRouter);
+
 // Health pubblico (no auth)
 app.get("/health", async (_req: express.Request, res: express.Response) => {
     try {
@@ -44,6 +54,10 @@ app.get("/health", async (_req: express.Request, res: express.Response) => {
         return res.status(503).json({ ok: false });
     }
 });
+app.get("/api/_debug/ping", (_req, res) => {
+    res.json({ ok: true, ping: "pong" });
+});
+
 
 // Rate limit solo admin
 const adminLimiter = rateLimit({ windowMs: 60_000, max: 60 });

@@ -10,7 +10,7 @@ if (!GRAPH_SERVICE_URL) throw new Error("Missing GRAPH_SERVICE_URL");
 if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
 
 // Catch-all: qualunque path sotto /api/admin/graph/*
-graphProxyRouter.use(async (req, res) => {
+graphProxyRouter.use(async (req: Request, res: Response) => {
     try {
         const base = GRAPH_SERVICE_URL.replace(/\/+$/, "");
         const forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "");
