@@ -43,32 +43,16 @@ adminRouter.post("/test-scenarios/:id/initialize", async (req, res) => {
             from test_scenario_applications
             where scenario_id = $1
         `, [scenarioId]);
-            // 4) riattiva utenti coinvolti (ACTIVE NON ESISTE -> usiamo AVAILABLE)
+            // 4) riattiva utenti coinvolti
             await client.query(`
-                    update users
-                    set availability_status = 'available'
-                    where id in (
-                        select distinct user_id
-                        from test_scenario_applications
-                        where scenario_id = $1
-                    )
-                `, [scenarioId]);
-            // 5) riallinea application_count (consistenza)
-            await client.query(`
-                    update users u
-                    set application_count = coalesce(a.cnt, 0)
-                    from (
-                        select user_id, count(*)::int as cnt
-                        from applications
-                        group by user_id
-                    ) a
-                    where u.id = a.user_id
-                `);
-            await client.query(`
-                    update users
-                    set application_count = 0
-                    where id not in (select distinct user_id from applications)
-                `);
+          update users
+          set availability_status = 'active'
+          where id in (
+            select distinct user_id
+            from test_scenario_applications
+            where scenario_id = $1
+          )
+        `, [scenarioId]);
             return {
                 insertedApplications: rows.rowCount,
                 activatedUsers: rows.rowCount,

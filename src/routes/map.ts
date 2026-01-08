@@ -75,12 +75,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 .from("applications")
                 .select(
                     `
-          position_id,
-          priority,
-          positions (
-            occupied_by
-          )
-        `
+                    position_id,
+                    priority,
+                    positions (
+                        occupied_by
+                    )
+                `
                 )
                 .eq("user_id", viewerUserId);
 
@@ -136,16 +136,17 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         relatedUserIds = Array.from(new Set(relatedUserIds));
 
         /**
-         * 4) USERS “mappabili”
-         * Serve:
-         * - role_id + roles.name
-         * - location_id + locations(lat/lng)
-         * - position_id = positions.id dove positions.occupied_by = users.id  ✅ (questa è la chiave!)
-         */
-        const { data: users, error: usersErr } = await supabaseAdmin
-            .from("users")
+ * 4) POSITIONS “mappabili” (positions-first ✅)
+ * Prendiamo le posizioni occupate e ci agganciamo all'utente occupante.
+ * Così position_id è SEMPRE positions.id e non dipende da join inversi.
+ */
+        const { data: occupiedPositions, error: posErr } = await supabaseAdmin
+            .from("positions")
             .select(
                 `
+      id,
+      occupied_by,
+      users:occupied_by (
         id,
         full_name,
         availability_status,
@@ -159,14 +160,14 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
           name,
           latitude,
           longitude
-        ),
-        positions:positions!occupied_by (
-          id
         )
-      `
-            );
+      )
+    `
+            )
+            .not("occupied_by", "is", null);
 
-        if (usersErr) throw usersErr;
+        if (posErr) throw posErr;
+
 
         // 5) aggregazione byLocation -> roles -> users
         const byLocation: Record<
@@ -189,20 +190,21 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             }
         > = {};
 
-        for (const u of users ?? []) {
-            if (u.availability_status !== "available") continue;
+        for (const p of occupiedPositions ?? []) {
+            // position_id reale e stabile
+            const positionId = (p as any).id;
+            if (!positionId) continue;
+
+            const u = (p as any).users;
+            if (!u) continue;
+
+            if ((u.availability_status ?? "").toString().toLowerCase() !== "available") continue;
 
             const loc = Array.isArray((u as any).locations) ? (u as any).locations[0] : (u as any).locations;
             if (!loc) continue;
 
             const roleId = (u as any).role_id ?? "unknown";
             const roleName = (u as any).roles?.name ?? "—";
-
-            // posizione “occupata” dell’utente = positions.id (via FK positions.occupied_by)
-            const posArr = (u as any).positions;
-            const posObj = Array.isArray(posArr) ? posArr[0] : posArr;
-            const positionId = posObj?.id;
-            if (!positionId) continue; // senza positionId non posso candidarmi a lui
 
             if (!byLocation[loc.id]) {
                 byLocation[loc.id] = {
@@ -227,16 +229,21 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             byLocation[loc.id].roles[roleId].users.push({
                 id: u.id,
                 full_name: u.full_name,
-                position_id: positionId, // ✅ ADESSO è positions.id (corretto)
+                position_id: positionId, // ✅ SEMPRE positions.id
             });
 
-            // applied/priority coerenti col mode
+            // applied/priority coerenti col mode (relatedUserIds contiene user_id)
             if (relatedUserIds.includes(u.id)) {
                 byLocation[loc.id].roles[roleId].applied = true;
-                const p = userPriorityMap[u.id];
-                if (p != null) byLocation[loc.id].roles[roleId].priority = p;
+
+                const pBest = userPriorityMap[u.id];
+                if (pBest != null) {
+                    const prev = byLocation[loc.id].roles[roleId].priority;
+                    byLocation[loc.id].roles[roleId].priority = prev == null ? pBest : Math.min(prev, pBest);
+                }
             }
         }
+
 
         const locations = Object.values(byLocation).map((loc) => ({
             ...loc,

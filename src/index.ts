@@ -10,6 +10,7 @@ import { graphProxyRouter } from "./routes/graphProxy.js";
 import { pool } from "./db.js";
 import { syncGraphRouter } from "./routes/syncGraph.js";
 import { mapRouter } from "./routes/map.js";
+import { applicationsRouter } from "./routes/applications.js";
 
 
 
@@ -44,6 +45,8 @@ app.use(
 
 
 app.use("/api/map", mapRouter);
+app.use("/api", applicationsRouter);
+
 
 // Health pubblico (no auth)
 app.get("/health", async (_req: express.Request, res: express.Response) => {
