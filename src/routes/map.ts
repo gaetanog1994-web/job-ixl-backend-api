@@ -12,7 +12,6 @@ export const mapRouter = Router();
  */
 mapRouter.get("/positions", requireAuth, async (req, res) => {
     const r = req as AuthedRequest;
-
     const tokenUserId = r.user.id;
     const viewerUserId = (req.query.viewerUserId as string) || tokenUserId;
     const mode = (req.query.mode as string) === "to" ? "to" : "from";
@@ -132,25 +131,24 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         // 4) users + join positions + locations
         const { data: users, error: usersErr } = await supabaseAdmin
             .from("users")
-            .select(
-                `
+            .select(`
     id,
     full_name,
     availability_status,
     position_id,
+    role_id,
+    roles:role_id (
+      name
+    ),
     location_id,
     locations:location_id (
       id,
       name,
       latitude,
       longitude
-    ),
-    positions:position_id (
-      id,
-      role_name
     )
-  `
-            );
+  `);
+
         if (usersErr) throw usersErr;
 
 
