@@ -97,8 +97,18 @@ if (process.env.NODE_ENV !== "production") {
                 error: error?.message ?? null,
                 user: data?.user ? { id: data.user.id, email: data.user.email } : null,
             });
-        } catch (e: any) {
-            return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+        } catch (err: any) {
+            console.error("❌ map/positions error FULL:", err);
+            console.error("❌ message:", err?.message);
+            console.error("❌ details:", err?.details);
+            console.error("❌ hint:", err?.hint);
+            console.error("❌ stack:", err?.stack);
+
+            res.status(500).json({
+                error: "MAP_POSITIONS_FAILED",
+                message: err?.message ?? null,
+            });
         }
+
     });
 }
