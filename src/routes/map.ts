@@ -38,10 +38,21 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         // 2) viewer user (status + coords)
         const { data: me, error: meErr } = await supabaseAdmin
             .from("users")
-            .select("id, availability_status, latitude, longitude")
+            .select(
+                `
+    id,
+    availability_status,
+    location_id,
+    locations:location_id (
+      latitude,
+      longitude
+    )
+  `
+            )
             .eq("id", viewerUserId)
             .single();
         if (meErr) throw meErr;
+
 
         // 3) applications del viewer (per usedPriorities e applied)
         const { data: myApplications, error: appsErr } = await supabaseAdmin
@@ -227,19 +238,28 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
         const OFFSET = 0.002;
 
+        const locObj = Array.isArray((me as any).locations)
+            ? (me as any).locations[0]
+            : (me as any).locations;
+
+        const lat = locObj?.latitude;
+        const lng = locObj?.longitude;
+
         res.json({
             viewerUserId,
-            myStatus: (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
-                ? "available"
-                : "inactive",
+            myStatus:
+                (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
+                    ? "available"
+                    : "inactive",
             meLocation:
-                me.latitude != null && me.longitude != null
-                    ? { latitude: me.latitude + OFFSET, longitude: me.longitude + OFFSET }
+                lat != null && lng != null
+                    ? { latitude: lat + OFFSET, longitude: lng + OFFSET }
                     : null,
             maxApplications: config.max_applications,
             usedPriorities: Array.from(new Set(usedPriorities)),
             locations,
         });
+
     } catch (err: any) {
         console.error("❌ map/positions error", err);
         res.status(500).json({ error: "MAP_POSITIONS_FAILED" });
