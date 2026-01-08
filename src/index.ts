@@ -11,6 +11,7 @@ import { pool } from "./db.js";
 import { syncGraphRouter } from "./routes/syncGraph.js";
 import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
+import { usersRouter } from "./routes/users.js";
 
 
 
@@ -22,6 +23,7 @@ console.log("✅ BOOT BACKEND VERSION: MAP ROUTER ENABLED");
 
 app.use(express.json());
 app.use(correlation);
+app.use("/api/users", usersRouter);
 
 
 // CORS (prima delle route)
