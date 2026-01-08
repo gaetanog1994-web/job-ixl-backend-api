@@ -60,19 +60,32 @@ adminRouter.post(
                     [scenarioId]
                 );
 
-                // 4) riattiva utenti coinvolti (ACTIVE NON ESISTE -> usiamo AVAILABLE)
+                // 4) riattiva utenti coinvolti:
+                // - candidati (user_id)
+                // - target (occupanti delle posizioni a cui ci si candida)
                 await client.query(
                     `
-                    update users
-                    set availability_status = 'available'
-                    where id in (
-                        select distinct user_id
-                        from test_scenario_applications
-                        where scenario_id = $1
-                    )
-                `,
+                  update users
+                  set availability_status = 'available'
+                  where id in (
+                -- candidati
+                select distinct user_id
+                from test_scenario_applications
+                where scenario_id = $1
+
+                union
+
+                -- occupanti delle posizioni target
+                select distinct p.occupied_by
+                from test_scenario_applications tsa
+                join positions p on p.id = tsa.position_id
+                where tsa.scenario_id = $1
+                  and p.occupied_by is not null
+                  )
+                  `,
                     [scenarioId]
                 );
+
 
                 // 5) riallinea application_count (consistenza)
                 await client.query(`
