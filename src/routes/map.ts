@@ -134,24 +134,25 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             .from("users")
             .select(
                 `
-        id,
-        full_name,
-        availability_status,
-        position_id,
-        positions (
-          id,
-          role_name,
-          location_id,
-          locations (
-            id,
-            name,
-            latitude,
-            longitude
-          )
-        )
-      `
+    id,
+    full_name,
+    availability_status,
+    position_id,
+    location_id,
+    locations:location_id (
+      id,
+      name,
+      latitude,
+      longitude
+    ),
+    positions:position_id (
+      id,
+      role_name
+    )
+  `
             );
         if (usersErr) throw usersErr;
+
 
         // 5) aggregazione: byLocation -> roles -> users
         const byLocation: Record<
@@ -181,10 +182,13 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 ? (u as any).positions[0]
                 : (u as any).positions;
 
-            if (!pos) continue;
+            const loc = Array.isArray((u as any).locations)
+                ? (u as any).locations[0]
+                : (u as any).locations;
 
-            const loc = Array.isArray(pos.locations) ? pos.locations[0] : pos.locations;
+            if (!pos) continue;
             if (!loc) continue;
+
 
             // qui "pos" è il tuo "role/position" (id + role_name + location_id)
             const role = pos;
