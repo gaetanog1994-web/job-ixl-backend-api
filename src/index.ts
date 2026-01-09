@@ -65,17 +65,36 @@ app.get("/api/_debug/ping", (_req, res) => {
 });
 
 
-// Rate limit solo admin
-const adminLimiter = rateLimit({ windowMs: 60_000, max: 60 });
+// Rate limit solo admin (1 volta sola, key = userId se disponibile)
+const adminLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req as any).user?.id ?? req.ip,
+});
 
-// Admin API (protetta)
-app.use("/api/admin", adminLimiter, requireAuth, requireAdmin, adminRouter);
+// ✅ Un solo "admin stack" senza duplicazioni
+const adminApi = express.Router();
 
-// Sync graph
-app.use("/api/admin/sync-graph", adminLimiter, requireAuth, requireAdmin, syncGraphRouter);
+// Ordine importante:
+// 1) requireAuth -> setta req.user
+// 2) rateLimit -> usa req.user.id come key
+// 3) requireAdmin -> RBAC app_admins
+adminApi.use(requireAuth, adminLimiter, requireAdmin);
 
-// Graph proxy (SOLO admin)
-app.use("/api/admin/graph", adminLimiter, requireAuth, requireAdmin, graphProxyRouter);
+// rotte admin “normali”
+adminApi.use("/", adminRouter);
+
+// graph sync
+adminApi.use("/sync-graph", syncGraphRouter);
+
+// graph proxy (warmup/chains/...)
+adminApi.use("/graph", graphProxyRouter);
+
+// mount unico
+app.use("/api/admin", adminApi);
+
 
 // IMPORTANT: nessuna route pubblica tipo /api/graph
 
