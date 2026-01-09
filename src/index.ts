@@ -23,7 +23,7 @@ console.log("✅ BOOT BACKEND VERSION: MAP ROUTER ENABLED");
 
 app.use(express.json());
 app.use(correlation);
-app.use("/api/users", usersRouter);
+app.use("/api/users", requireAuth, usersRouter);
 
 
 // CORS (prima delle route)

@@ -230,8 +230,6 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             const u = (p as any).users;
             if (!u) continue;
 
-            if ((u.availability_status ?? "").toString().toLowerCase() !== "available") continue;
-
             const loc = Array.isArray((u as any).locations) ? (u as any).locations[0] : (u as any).locations;
             if (!loc) continue;
 
