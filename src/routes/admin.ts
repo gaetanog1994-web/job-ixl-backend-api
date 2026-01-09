@@ -3,6 +3,7 @@ import { withTx } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
+import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
 
 
 export const adminRouter = Router();
@@ -111,6 +112,7 @@ adminRouter.post(
                     activatedUsers: rows.rowCount,
                 };
             });
+            invalidateMapCache();
 
             await audit(
                 "scenario_initialize",
@@ -154,6 +156,7 @@ adminRouter.post(
                 ]);
                 return { deactivatedUserId: userId };
             });
+            invalidateMapCache();
 
             await audit(
                 "user_deactivate",
@@ -355,6 +358,7 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
                 usersUpdated: updUsers.rowCount,
             };
         });
+        invalidateMapCache();
 
 
         await audit("users_reset_active", r.user.id, {}, out, correlationId);
