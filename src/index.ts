@@ -18,7 +18,7 @@ import { usersRouter } from "./routes/users.js";
 const app = express();
 app.set("trust proxy", 1);
 
-console.log("✅ BOOT BACKEND VERSION: MAP ROUTER ENABLED");
+console.log("✅ BOOT BACKEND VERSION: BETA5_DIST_REBUILD_TEST_001");
 
 
 app.use(express.json());
