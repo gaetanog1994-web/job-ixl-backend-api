@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin } from "../db.js";
+import { invalidateMapCache } from "./map.js";
 
 export const applicationsRouter = Router();
 
@@ -94,6 +95,7 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             priority,
         }));
 
+
         const { error: insErr } = await supabaseAdmin.from("applications").insert(rows);
         if (insErr) {
             // idempotenza "soft": se ci sono duplicati e hai un vincolo unique, qui potrebbe esplodere.
@@ -101,7 +103,7 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             // nel prossimo step lo gestiamo con upsert/onConflict.)
             return res.status(409).json({ error: "INSERT_FAILED", message: insErr.message });
         }
-
+        invalidateMapCache(); // ✅ ESATTAMENTE QUI
         return res.status(200).json({ ok: true, inserted: rows.length });
     } catch (err: any) {
         console.error("❌ applications bulk insert error", err);
@@ -147,7 +149,7 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
             .in("position_id", positionIds);
 
         if (delErr) throw delErr;
-
+        invalidateMapCache(); // ✅ ESATTAMENTE QUI
         return res.status(200).json({ ok: true, deleted: true });
     } catch (err: any) {
         console.error("❌ applications bulk delete error", err);
