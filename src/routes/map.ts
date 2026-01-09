@@ -28,6 +28,9 @@ function cacheSet(key: string, value: any) {
     mapCache.set(key, { value, expiresAt: Date.now() + MAP_CACHE_TTL_MS });
 }
 
+export function invalidateMapCache() {
+    mapCache.clear();
+}
 
 /**
  * GET /api/map/positions
@@ -230,6 +233,9 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             const u = (p as any).users;
             if (!u) continue;
 
+            const status = (u.availability_status ?? "").toString().toLowerCase();
+            if (status !== "available") continue;
+
             const loc = Array.isArray((u as any).locations) ? (u as any).locations[0] : (u as any).locations;
             if (!loc) continue;
 
@@ -306,3 +312,4 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         res.status(500).json({ error: "MAP_POSITIONS_FAILED" });
     }
 });
+
