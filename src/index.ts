@@ -106,6 +106,11 @@ adminApi.use("/", adminRouter);
 adminApi.use("/sync-graph", syncGraphRouter);
 
 // graph proxy (warmup/chains/...)
+adminApi.use("/graph", (req, res, next) => {
+    res.setHeader("x-hit-backend", "1");
+    next();
+});
+
 adminApi.use("/graph", graphProxyRouter);
 
 // mount unico
