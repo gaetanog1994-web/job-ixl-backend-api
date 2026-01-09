@@ -68,7 +68,7 @@ app.get("/api/_debug/ping", (_req, res) => {
 // Rate limit solo admin (1 volta sola, key = userId se disponibile)
 const adminLimiter = rateLimit({
     windowMs: 60_000,
-    max: 300, // ⬅️ TEMPORANEO
+    max: 600, // ⬅️ TEMPORANEO
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req as any).user?.id ?? req.ip,
