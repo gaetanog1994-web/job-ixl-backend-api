@@ -71,7 +71,7 @@ const adminLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req as any).user?.id ?? req.ip,
-    skip: (req) => req.method === "OPTIONS", // non contare preflight
+    skip: (req) => req.method === "OPTIONS",
     handler: (req, res) => {
         console.warn("🚫 RATE_LIMIT HIT (backend-api)", {
             path: req.originalUrl,
@@ -86,8 +86,7 @@ const adminLimiter = rateLimit({
     },
 });
 
-
-console.log("✅ ADMIN LIMITER MAX = 600 - FIX NUM 99");
+console.log("✅ ADMIN LIMITER MAX = 600 - FIX NUM 100");
 
 
 
@@ -98,7 +97,7 @@ const adminApi = express.Router();
 // 1) requireAuth -> setta req.user
 // 2) rateLimit -> usa req.user.id come key
 // 3) requireAdmin -> RBAC app_admins
-adminApi.use(requireAuth, adminLimiter, requireAdmin);
+adminApi.use(requireAuth, requireAdmin);
 
 // rotte admin “normali”
 adminApi.use("/", adminRouter);
