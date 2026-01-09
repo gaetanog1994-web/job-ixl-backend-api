@@ -68,11 +68,23 @@ app.get("/api/_debug/ping", (_req, res) => {
 // Rate limit solo admin (1 volta sola, key = userId se disponibile)
 const adminLimiter = rateLimit({
     windowMs: 60_000,
-    max: 600, // ⬅️ TEMPORANEO
+    max: 600,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req as any).user?.id ?? req.ip,
+    handler: (req, res) => {
+        console.warn("🚫 RATE_LIMIT HIT (backend-api)", {
+            path: req.originalUrl,
+            userId: (req as any).user?.id,
+            ip: req.ip,
+        });
+        return res.status(429).json({
+            error: "RATE_LIMIT_BACKEND",
+            message: "Too many requests (backend-api limiter)",
+        });
+    },
 });
+
 console.log("✅ ADMIN LIMITER MAX = 600");
 
 
