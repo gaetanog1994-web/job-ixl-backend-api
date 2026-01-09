@@ -18,7 +18,7 @@ import { usersRouter } from "./routes/users.js";
 const app = express();
 app.set("trust proxy", 1);
 
-console.log("✅ BOOT BACKEND VERSION: BETA5_DIST_REBUILD_TEST_001");
+console.log("✅ BOOT BACKEND VERSION: BETA5");
 
 
 app.use(express.json());
@@ -65,28 +65,16 @@ app.get("/api/_debug/ping", (_req, res) => {
 });
 
 
+// Rate limit solo admin (pulito, production-grade)
+// NOTA: keyGenerator usa req.user.id -> quindi va messo DOPO requireAuth nello stack admin
 const adminLimiter = rateLimit({
     windowMs: 60_000,
-    max: 600,
+    max: 60,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req as any).user?.id ?? req.ip,
-    skip: (req) => req.method === "OPTIONS",
-    handler: (req, res) => {
-        console.warn("🚫 RATE_LIMIT HIT (backend-api)", {
-            path: req.originalUrl,
-            userId: (req as any).user?.id,
-            ip: req.ip,
-        });
-        res.setHeader("x-rate-limit-by", "backend-api");
-        return res.status(429).json({
-            error: "RATE_LIMIT_BACKEND",
-            message: "Too many requests (backend-api limiter)",
-        });
-    },
 });
 
-console.log("✅ ADMIN LIMITER MAX = 600 - FIX NUM 100");
 
 
 
@@ -97,7 +85,7 @@ const adminApi = express.Router();
 // 1) requireAuth -> setta req.user
 // 2) rateLimit -> usa req.user.id come key
 // 3) requireAdmin -> RBAC app_admins
-adminApi.use(requireAuth, requireAdmin);
+adminApi.use(requireAuth, adminLimiter, requireAdmin);
 
 // rotte admin “normali”
 adminApi.use("/", adminRouter);
@@ -106,11 +94,6 @@ adminApi.use("/", adminRouter);
 adminApi.use("/sync-graph", syncGraphRouter);
 
 // graph proxy (warmup/chains/...)
-adminApi.use("/graph", (req, res, next) => {
-    res.setHeader("x-hit-backend", "1");
-    next();
-});
-
 adminApi.use("/graph", graphProxyRouter);
 
 // mount unico
