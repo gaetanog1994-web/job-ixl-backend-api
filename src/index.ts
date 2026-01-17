@@ -47,8 +47,8 @@ app.use(
 
 // ✅ DOPO CORS
 app.use("/api/users", requireAuth, usersRouter);
-app.use("/api/map", mapRouter);
-app.use("/api", applicationsRouter);
+app.use("/api/map", requireAuth, mapRouter);
+app.use("/api", requireAuth, applicationsRouter);
 
 
 // Health pubblico (no auth)
