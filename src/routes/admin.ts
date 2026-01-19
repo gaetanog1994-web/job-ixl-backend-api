@@ -181,6 +181,153 @@ adminRouter.post(
 );
 
 /**
+ * POST /api/admin/config/max-applications
+ * Aggiorna max_applications (singleton) e ribilancia le applications in modo deterministico.
+ * Product rule: niente logica nel DB (no trigger), tutto in backend.
+ */
+adminRouter.post("/config/max-applications", async (req: Request, res: Response) => {
+    const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+
+    try {
+        const { maxApplications } = req.body ?? {};
+        const newMax = Number(maxApplications);
+
+        if (!Number.isFinite(newMax) || newMax < 1 || newMax > 50) {
+            return res.status(400).json({
+                error: "Invalid maxApplications. Must be a number between 1 and 50.",
+                correlationId,
+            });
+        }
+
+        const out = await withTx(async (client) => {
+            // 1) leggi old max (singleton)
+            const oldRow = await client.query(
+                `select max_applications from app_config where singleton = true limit 1`
+            );
+            const oldMax: number | null = oldRow.rows?.[0]?.max_applications ?? null;
+
+            // 2) aggiorna config
+            const upd = await client.query(
+                `update app_config set max_applications = $1 where singleton = true`,
+                [newMax]
+            );
+
+            // 3) se max aumenta o non cambia → nessun rebalance
+            if (oldMax !== null && newMax >= oldMax) {
+                return {
+                    oldMax,
+                    newMax,
+                    rebalance: { performed: false, reason: "max did not decrease" },
+                };
+            }
+
+            // 4) REBALANCE (solo se max diminuisce oppure oldMax null)
+            // Regola deterministica:
+            // - per ogni user_id, ordina apps per priority asc, created_at asc, id asc
+            // - tieni le prime newMax
+            // - set priority = 1..N (contigue)
+            // - delete delle eccedenti
+            //
+            // NB: facciamo tutto SQL-side per performance, ma logica è nel backend (non trigger).
+            const rebalanceDelete = await client.query(
+                `
+        with ranked as (
+          select
+            id,
+            user_id,
+            row_number() over (
+              partition by user_id
+              order by priority asc nulls last, created_at asc, id asc
+            ) as rn
+          from applications
+        )
+        delete from applications a
+        using ranked r
+        where a.id = r.id
+          and r.rn > $1
+        `,
+                [newMax]
+            );
+
+            const rebalanceUpdate = await client.query(
+                `
+        with ranked as (
+          select
+            id,
+            user_id,
+            row_number() over (
+              partition by user_id
+              order by priority asc nulls last, created_at asc, id asc
+            ) as rn
+          from applications
+        )
+        update applications a
+        set priority = r.rn
+        from ranked r
+        where a.id = r.id
+          and a.priority is distinct from r.rn
+        `
+            );
+
+            // 5) riallinea application_count (consistenza)
+            await client.query(`
+        update users u
+        set application_count = coalesce(a.cnt, 0)
+        from (
+          select user_id, count(*)::int as cnt
+          from applications
+          group by user_id
+        ) a
+        where u.id = a.user_id
+      `);
+
+            await client.query(`
+        update users
+        set application_count = 0
+        where id not in (select distinct user_id from applications)
+      `);
+
+            return {
+                oldMax,
+                newMax,
+                rebalance: {
+                    performed: true,
+                    deleted: rebalanceDelete.rowCount ?? 0,
+                    prioritiesUpdated: rebalanceUpdate.rowCount ?? 0,
+                },
+            };
+        });
+
+        invalidateMapCache();
+
+        await audit(
+            "config_update_max_applications",
+            r.user.id,
+            { newMax },
+            out,
+            correlationId
+        );
+
+        return res.status(200).json({ ok: true, out, correlationId });
+    } catch (e: any) {
+        await audit(
+            "config_update_max_applications",
+            (req as any)?.user?.id ?? "unknown",
+            { body: req.body ?? {} },
+            { error: String(e?.message ?? e) },
+            (req as any).correlationId
+        );
+
+        return res.status(500).json({
+            error: "Update max applications failed",
+            detail: String(e?.message ?? e),
+            correlationId: (req as any).correlationId,
+        });
+    }
+});
+
+/**
  * POST /api/admin/sync-graph
  * Rebuild completo del grafo Neo4j (on-demand, admin-only)
  */
