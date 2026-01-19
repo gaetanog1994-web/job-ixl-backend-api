@@ -6,14 +6,19 @@ import { createClient } from "@supabase/supabase-js";
 
 const caPath = process.env.SUPABASE_DB_CA_PATH;
 
-const ssl = caPath
-    ? { ca: fs.readFileSync(path.resolve(caPath), "utf8") }
-    : undefined;
+// NODE_ENV=production su Render. In locale spesso non è settato, quindi default = dev.
+const isProd = process.env.NODE_ENV === "production";
+
+const ssl =
+    caPath && caPath.trim()
+        ? { ca: fs.readFileSync(path.resolve(caPath), "utf8") }
+        : { rejectUnauthorized: isProd }; // prod=true, dev=false
 
 export const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl,
 });
+
 
 export const supabaseAdmin = createClient(
     process.env.SUPABASE_URL!,
