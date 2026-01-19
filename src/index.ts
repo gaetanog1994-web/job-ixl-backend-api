@@ -56,9 +56,14 @@ app.get("/health", async (_req: express.Request, res: express.Response) => {
     try {
         await pool.query("select 1");
         return res.status(200).json({ ok: true });
-    } catch {
-        return res.status(503).json({ ok: false });
+    } catch (e: any) {
+        console.error("HEALTH_DB_FAILED", {
+            message: e?.message ?? String(e),
+            code: e?.code,
+        });
+        return res.status(503).json({ ok: false, error: e?.message ?? String(e) });
     }
+
 });
 app.get("/api/_debug/ping", (_req, res) => {
     res.json({ ok: true, ping: "pong" });
