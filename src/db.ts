@@ -11,8 +11,15 @@ const isProd = process.env.NODE_ENV === "production";
 
 const ssl =
     caPath && caPath.trim()
-        ? { ca: fs.readFileSync(path.resolve(caPath), "utf8") }
-        : { rejectUnauthorized: isProd }; // prod=true, dev=false
+        ? {
+            ca: fs.readFileSync(path.resolve(caPath), "utf8"),
+            rejectUnauthorized: true,
+        }
+        : {
+            // ✅ in dev: accetta chain non verificabile senza toccare TLS globale
+            rejectUnauthorized: false,
+        };
+
 
 export const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
