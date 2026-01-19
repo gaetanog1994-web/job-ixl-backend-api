@@ -2,6 +2,7 @@ import { Router } from "express";
 import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin } from "../db.js";
 import { invalidateMapCache } from "./map.js";
+import { audit } from "../audit.js";
 
 export const applicationsRouter = Router();
 
@@ -19,6 +20,7 @@ export const applicationsRouter = Router();
  */
 applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (req, res) => {
     const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId;
 
     const tokenUserId = r.user.id;
     const targetUserId = req.params.userId || tokenUserId;
@@ -96,7 +98,9 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         }));
 
 
-        const { error: insErr } = await supabaseAdmin.from("applications").insert(rows);
+        const { error: insErr } = await supabaseAdmin
+            .from("applications")
+            .upsert(rows, { onConflict: "user_id,position_id", ignoreDuplicates: true });
         if (insErr) {
             // idempotenza "soft": se ci sono duplicati e hai un vincolo unique, qui potrebbe esplodere.
             // Per ora: ritorniamo errore esplicito. (Se mi confermi unique(user_id, position_id),
@@ -104,6 +108,25 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             return res.status(409).json({ error: "INSERT_FAILED", message: insErr.message });
         }
         invalidateMapCache(); // ✅ ESATTAMENTE QUI
+        const { count, error: cntErr } = await supabaseAdmin
+            .from("applications")
+            .select("*", { count: "exact", head: true })
+            .eq("user_id", targetUserId);
+
+        if (!cntErr) {
+            await supabaseAdmin
+                .from("users")
+                .update({ application_count: count ?? 0 })
+                .eq("id", targetUserId);
+        }
+
+        await audit(
+            "applications_bulk_apply",
+            r.user.id,
+            { targetUserId, priority, positionIdsCount: positionIds.length },
+            { inserted: rows.length, application_count: count ?? null },
+            correlationId
+        );
         return res.status(200).json({ ok: true, inserted: rows.length });
     } catch (err: any) {
         console.error("❌ applications bulk insert error", err);
@@ -117,6 +140,7 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
  */
 applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async (req, res) => {
     const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId;
 
     const tokenUserId = r.user.id;
     const targetUserId = req.params.userId || tokenUserId;
@@ -124,7 +148,7 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
     // 🔐 Admin enforcement se opero per un altro user
     if (targetUserId !== tokenUserId) {
         await new Promise<void>((resolve, reject) => {
-            requireAdmin(r, res, (err?: any) => (err ? reject(err) : resolve()));
+            requireAdmin(r, res, (e?: any) => (e ? reject(e) : resolve()));
         });
     }
 
@@ -149,10 +173,43 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
             .in("position_id", positionIds);
 
         if (delErr) throw delErr;
-        invalidateMapCache(); // ✅ ESATTAMENTE QUI
-        return res.status(200).json({ ok: true, deleted: true });
+
+        invalidateMapCache();
+
+        // riallinea application_count (consistenza minima)
+        const { count, error: cntErr } = await supabaseAdmin
+            .from("applications")
+            .select("*", { count: "exact", head: true })
+            .eq("user_id", targetUserId);
+
+        if (!cntErr) {
+            await supabaseAdmin
+                .from("users")
+                .update({ application_count: count ?? 0 })
+                .eq("id", targetUserId);
+        }
+
+        await audit(
+            "applications_bulk_withdraw",
+            r.user.id,
+            { targetUserId, positionIdsCount: positionIds.length },
+            { application_count: count ?? null },
+            correlationId
+        );
+
+        return res.status(200).json({ ok: true, deleted: true, application_count: count ?? null });
     } catch (err: any) {
         console.error("❌ applications bulk delete error", err);
+
+        await audit(
+            "applications_bulk_withdraw",
+            r.user.id,
+            { targetUserId },
+            { error: String(err?.message ?? err) },
+            correlationId
+        );
+
         return res.status(500).json({ error: "APPLICATIONS_BULK_DELETE_FAILED" });
     }
 });
+
