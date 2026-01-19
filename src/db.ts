@@ -18,6 +18,9 @@ export const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl,
 });
+console.log("DB ssl config:", ssl);
+console.log("NODE_ENV:", process.env.NODE_ENV);
+console.log("DATABASE_URL present:", !!process.env.DATABASE_URL);
 
 
 export const supabaseAdmin = createClient(
