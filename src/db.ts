@@ -21,10 +21,21 @@ const ssl =
         };
 
 
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) throw new Error("Missing DATABASE_URL");
+
+// Parse URL per evitare che eventuali parametri SSL dentro la stringa sovrascrivano config
+const u = new URL(DATABASE_URL);
+
 export const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl,
+    host: u.hostname,
+    port: u.port ? Number(u.port) : 5432,
+    database: u.pathname.replace(/^\//, "") || "postgres",
+    user: decodeURIComponent(u.username),
+    password: decodeURIComponent(u.password),
+    ssl, // ✅ qui ora è “source of truth”
 });
+
 console.log("DB ssl config:", ssl);
 console.log("NODE_ENV:", process.env.NODE_ENV);
 console.log("DATABASE_URL present:", !!process.env.DATABASE_URL);
