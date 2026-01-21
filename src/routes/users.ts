@@ -21,14 +21,21 @@ usersRouter.post("/me/deactivate", requireAuth, async (req: Request, res: Respon
 
             const upd = await client.query(
                 `update users
-         set availability_status = 'inactive',
-             application_count = 0
-         where id = $1
-         returning id, availability_status`,
+                    set availability_status = 'inactive',
+                        show_position = false,
+                        application_count = 0
+                    where id = $1
+                    returning id, availability_status, show_position
+                `,
                 [r.user.id]
             );
 
-            return { userId: r.user.id, status: upd.rows?.[0]?.availability_status ?? "inactive" };
+            return {
+                userId: r.user.id,
+                status: upd.rows?.[0]?.availability_status ?? "inactive",
+                showPosition: upd.rows?.[0]?.show_position ?? false,
+            };
+
         });
         invalidateMapCache();
         await audit("user_deactivate_self", r.user.id, {}, out, correlationId);
@@ -53,14 +60,20 @@ usersRouter.post("/me/activate", requireAuth, async (req: Request, res: Response
             const upd = await client.query(
                 `
                 update users
-                set availability_status = 'available'
-                where id = $1
-                returning id, availability_status
+                    set availability_status = 'available',
+                        show_position = true
+                    where id = $1
+                    returning id, availability_status, show_position
                 `,
                 [r.user.id]
             );
 
-            return { userId: r.user.id, status: upd.rows?.[0]?.availability_status ?? "available" };
+            return {
+                userId: r.user.id,
+                status: upd.rows?.[0]?.availability_status ?? "available",
+                showPosition: upd.rows?.[0]?.show_position ?? true,
+            };
+
         });
 
         invalidateMapCache(); // ✅ ESATTAMENTE QUI (come deactivate)
