@@ -24,3 +24,13 @@ test("admin middleware blocks non-admin even if route doesn't exist", async () =
     // admin passa RBAC e poi prende 404 perché route non esiste
     assert.equal(adminHit.res.status, 404);
 });
+
+
+test("error shape includes correlationId", async () => {
+    const r = await apiFetch("/api/admin/__nonexistent", null);
+    // senza token -> 401/403
+    const { json } = r;
+    assert.equal(typeof json?.correlationId, "string");
+    assert.equal(json?.ok, false);
+    assert.ok(json?.error?.code);
+});

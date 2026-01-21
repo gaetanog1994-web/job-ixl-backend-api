@@ -2,11 +2,19 @@ import { Request, Response, NextFunction } from "express";
 import crypto from "crypto";
 import { pool } from "./db.js"; // ✅ NO .js (evita risoluzioni ambigue in dev con tsx)
 
-export function correlation(req: Request, _res: Response, next: NextFunction) {
-    (req as any).correlationId =
-        req.headers["x-correlation-id"] || crypto.randomUUID();
+export function correlation(req: Request, res: Response, next: NextFunction) {
+    const raw = req.headers["x-correlation-id"];
+    const incoming = Array.isArray(raw) ? raw[0] : raw;
+    const id = (incoming && String(incoming)) || crypto.randomUUID();
+
+    (req as any).correlationId = id;
+
+    // utile: torna sempre al client
+    res.setHeader("x-correlation-id", id);
+
     next();
 }
+
 
 // ✅ Audit deve essere best-effort: mai buttare giù l’API se il log fallisce
 export async function audit(

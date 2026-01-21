@@ -16,6 +16,19 @@ import { usersRouter } from "./routes/users.js";
 
 
 const app = express();
+function getCorrelationId(req: any) {
+    return req?.correlationId ?? null;
+}
+
+function sendError(res: any, req: any, status: number, code: string, message: string, extra?: any) {
+    const correlationId = getCorrelationId(req);
+    return res.status(status).json({
+        ok: false,
+        error: { code, message, ...(extra ? { extra } : {}) },
+        correlationId,
+    });
+}
+
 app.set("trust proxy", 1);
 
 console.log("✅ BOOT BACKEND VERSION: BETA5");
@@ -55,19 +68,22 @@ app.use("/api", requireAuth, applicationsRouter);
 app.get("/health", async (_req: express.Request, res: express.Response) => {
     try {
         await pool.query("select 1");
-        return res.status(200).json({ ok: true });
+        return res.status(200).json({ ok: true, correlationId: getCorrelationId(_req) });
+
     } catch (e: any) {
         console.error("HEALTH_DB_FAILED", {
             message: e?.message ?? String(e),
             code: e?.code,
         });
-        return res.status(503).json({ ok: false, error: e?.message ?? String(e) });
+        return sendError(res, _req, 503, "DB_UNAVAILABLE", e?.message ?? String(e));
+
     }
 
 });
-app.get("/api/_debug/ping", (_req, res) => {
-    res.json({ ok: true, ping: "pong" });
+app.get("/api/_debug/ping", (req, res) => {
+    return res.json({ ok: true, ping: "pong", correlationId: getCorrelationId(req) });
 });
+
 
 
 // Rate limit solo admin (pulito, production-grade)
@@ -78,6 +94,9 @@ const adminLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => (req as any).user?.id ?? req.ip,
+    handler: (req, res, _next, options) => {
+        return sendError(res, req, options.statusCode, "RATE_LIMITED", "Too many requests");
+    },
 });
 
 
@@ -103,14 +122,6 @@ adminApi.use("/graph", graphProxyRouter);
 
 // mount unico
 app.use("/api/admin", adminApi);
-
-
-// IMPORTANT: nessuna route pubblica tipo /api/graph
-
-const PORT = Number(process.env.PORT ?? 3000);
-app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Backend API up on http://localhost:${PORT}`);
-});
 
 if (process.env.NODE_ENV !== "production") {
     app.post("/_debug/auth-check", async (req: express.Request, res: express.Response) => {
@@ -146,3 +157,51 @@ if (process.env.NODE_ENV !== "production") {
 
     });
 }
+
+// 404 JSON (sempre)
+app.use((req, res) => {
+    return sendError(res, req, 404, "NOT_FOUND", "Route not found");
+});
+
+// Error handler globale (sempre JSON + correlationId)
+app.use((err: any, req: any, res: any, _next: any) => {
+    // Se headers già inviati, lascia fare a Express
+    if (res.headersSent) return;
+
+    const msg = String(err?.message ?? "Unknown error");
+
+    // CORS
+    if (msg === "CORS blocked") {
+        return sendError(res, req, 403, "CORS_BLOCKED", "Origin not allowed");
+    }
+
+    // Rate limit (express-rate-limit usa spesso status 429)
+    const status = Number(err?.status ?? err?.statusCode ?? 500);
+
+    // Codici “standard”
+    const code =
+        status === 401 ? "UNAUTHORIZED" :
+            status === 403 ? "FORBIDDEN" :
+                status === 429 ? "RATE_LIMITED" :
+                    status === 400 ? "BAD_REQUEST" :
+                        "INTERNAL_ERROR";
+
+    // Se vuoi loggare server-side (senza leak di token)
+    console.error("API_ERROR", {
+        code,
+        status,
+        message: msg,
+        correlationId: getCorrelationId(req),
+    });
+
+    return sendError(res, req, status, code, msg);
+});
+
+// IMPORTANT: nessuna route pubblica tipo /api/graph
+
+const PORT = Number(process.env.PORT ?? 3000);
+app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Backend API up on http://localhost:${PORT}`);
+});
+
+
