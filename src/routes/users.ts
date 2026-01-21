@@ -1,11 +1,54 @@
 import { Router } from "express";
-import type { Request, Response } from "express";
+import type { Request, Response, NextFunction } from "express";
 import { requireAuth, type AuthedRequest } from "../auth.js";
 import { withTx } from "../db.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
 
-export const usersRouter = Router();
+
+// src/routes/users.ts
+import express from "express";
+
+import { pool } from "../db.js";
+
+export const usersRouter = express.Router();
+
+usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const userId = (req as any).user?.id;
+        if (!userId) {
+            const e: any = new Error("Missing authed user");
+            e.status = 401;
+            throw e;
+        }
+
+        // Scegli SOLO i campi che vuoi esporre al FE
+        const { rows } = await pool.query(
+            `select
+         id,
+         email,
+         availability_status,
+         location_id,
+         role_id,
+         fixed_location
+       from users
+       where id = $1
+       limit 1`,
+            [userId]
+        );
+
+        if (!rows[0]) {
+            const e: any = new Error("User row not found");
+            e.status = 404;
+            throw e;
+        }
+
+        return res.json({ ok: true, user: rows[0], correlationId: (req as any).correlationId ?? null });
+    } catch (err) {
+        next(err);
+    }
+});
+
 
 /**
  * POST /api/users/me/deactivate
