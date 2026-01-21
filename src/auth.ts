@@ -11,7 +11,11 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
 });
 
-export type AuthedRequest = Request & { user: { id: string; email?: string } };
+export type AuthedRequest = Request & {
+    user: { id: string; email?: string };
+    isAdmin?: boolean;
+};
+
 
 function httpError(status: number, message: string) {
     const e: any = new Error(message);
@@ -48,9 +52,29 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
 
         if (error) return next(httpError(500, "RBAC check failed"));
         if (!data) return next(httpError(403, "Admin only"));
+        r.isAdmin = true;
 
         return next();
     } catch (e: any) {
         return next(httpError(500, "Admin middleware failed"));
+    }
+}
+
+export async function attachIsAdmin(req: Request, _res: Response, next: NextFunction) {
+    try {
+        const r = req as AuthedRequest;
+
+        const { data, error } = await supabaseAdmin
+            .from("app_admins")
+            .select("user_id")
+            .eq("user_id", r.user.id)
+            .maybeSingle();
+
+        if (error) return next(httpError(500, "RBAC check failed"));
+
+        r.isAdmin = !!data;
+        return next();
+    } catch (e: any) {
+        return next(httpError(500, "RBAC middleware failed"));
     }
 }

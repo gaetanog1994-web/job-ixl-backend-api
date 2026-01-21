@@ -3,7 +3,7 @@ import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
 import type { Request, Response } from "express";
-import { requireAuth, requireAdmin } from "./auth.js";
+import { requireAuth, requireAdmin, attachIsAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
 import { adminRouter } from "./routes/admin.js";
 import { graphProxyRouter } from "./routes/graphProxy.js";
@@ -12,6 +12,7 @@ import { syncGraphRouter } from "./routes/syncGraph.js";
 import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
+
 
 
 
@@ -63,6 +64,13 @@ app.use("/api/users", requireAuth, usersRouter);
 app.use("/api/map", requireAuth, mapRouter);
 app.use("/api", requireAuth, applicationsRouter);
 
+app.get("/api/me", requireAuth, attachIsAdmin, (req, res) => {
+    const r = req as any;
+    res.json({
+        user: r.user,
+        isAdmin: r.isAdmin === true,
+    });
+});
 
 // Health pubblico (no auth)
 app.get("/health", async (_req: express.Request, res: express.Response) => {
