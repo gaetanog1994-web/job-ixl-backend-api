@@ -11,7 +11,7 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "node --test"
+    "test": "NODE_OPTIONS='--import=dotenv/config' node --test"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
