@@ -70,11 +70,16 @@ export async function attachIsAdmin(req: Request, _res: Response, next: NextFunc
             .eq("user_id", r.user.id)
             .maybeSingle();
 
-        if (error) return next(httpError(500, "RBAC check failed"));
+        if (error) {
+            (req as any).isAdmin = false;
+            return next();
+        }
 
-        r.isAdmin = !!data;
+        (req as any).isAdmin = !!data;
         return next();
-    } catch (e: any) {
-        return next(httpError(500, "RBAC middleware failed"));
+    } catch {
+        (req as any).isAdmin = false;
+        return next();
     }
 }
+
