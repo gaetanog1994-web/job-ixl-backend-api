@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { withTx } from "../db.js";
-import type { AuthedRequest } from "../auth.js";
+import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
@@ -332,7 +332,7 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
  * POST /api/admin/sync-graph
  * Rebuild completo del grafo Neo4j (on-demand, admin-only)
  */
-adminRouter.post("/sync-graph", async (req: Request, res: Response) => {
+adminRouter.post("/sync-graph", requireAuth, requireAdmin, async (req: Request, res: Response) => {
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
@@ -567,6 +567,24 @@ adminRouter.get("/candidatures", async (req, res, next) => {
             applications: rows,
             correlationId: (req as any).correlationId ?? null,
         });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.get("/users/active", requireAuth, requireAdmin, async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(
+            `
+      select id, full_name
+      from users
+      where availability_status = 'available'
+        and location_id is not null
+      order by full_name asc
+      `
+        );
+
+        return res.json({ ok: true, users: rows, correlationId: (req as any).correlationId ?? null });
     } catch (e) {
         next(e);
     }
