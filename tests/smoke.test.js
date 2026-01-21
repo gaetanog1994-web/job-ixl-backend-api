@@ -9,12 +9,10 @@ test("health is public", async () => {
 });
 
 test("auth required endpoints reject missing token", async () => {
-    const { res } = await apiFetch("/api/_debug/ping", null);
-    // /api/_debug/ping è sotto requireAuth? nel tuo file è public.
-    // Quindi usiamo /api/map/positions che è sotto requireAuth.
     const r2 = await apiFetch("/api/map/positions", null);
     assert.ok([401, 403].includes(r2.res.status));
 });
+
 
 test("admin middleware blocks non-admin even if route doesn't exist", async () => {
     const user = await login(process.env.TEST_USER_EMAIL, process.env.TEST_USER_PASSWORD);
