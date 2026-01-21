@@ -4,6 +4,7 @@ import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
+import { pool } from "../db.js";
 
 
 export const adminRouter = Router();
@@ -524,5 +525,49 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
             detail: String(e?.message ?? e),
             correlationId,
         });
+    }
+});
+
+adminRouter.get("/candidatures", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(
+            `
+      select
+        a.id,
+        a.priority,
+        a.created_at,
+
+        cand.full_name as candidate_full_name,
+        cand_role.name as candidate_role_name,
+        cand_loc.name as candidate_location_name,
+
+        occ.full_name as occupant_full_name,
+        occ_role.name as occupant_role_name,
+        occ_loc.name as occupant_location_name
+
+      from applications a
+      join users cand on cand.id = a.user_id
+
+      join positions p on p.id = a.position_id
+      join users occ on occ.id = p.occupied_by
+
+      left join roles cand_role on cand_role.id = cand.role_id
+      left join locations cand_loc on cand_loc.id = cand.location_id
+
+      left join roles occ_role on occ_role.id = occ.role_id
+      left join locations occ_loc on occ_loc.id = occ.location_id
+
+      order by a.created_at desc
+      limit 500
+      `
+        );
+
+        return res.json({
+            ok: true,
+            applications: rows,
+            correlationId: (req as any).correlationId ?? null,
+        });
+    } catch (e) {
+        next(e);
     }
 });
