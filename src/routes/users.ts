@@ -49,6 +49,71 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
     }
 });
 
+// GET /api/users/me/applications
+usersRouter.get("/me/applications", requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const userId = (req as any).user?.id;
+        if (!userId) {
+            const e: any = new Error("Missing authed user");
+            e.status = 401;
+            throw e;
+        }
+
+        const { rows } = await pool.query(
+            `
+      select
+        a.id as app_id,
+        a.position_id,
+        a.priority,
+        a.created_at,
+
+        p.id as pos_id,
+        p.occupied_by,
+
+        ou.id as occ_user_id,
+        ou.full_name as occ_full_name,
+        ou.fixed_location as occ_fixed_location,
+
+        r.name as occ_role_name,
+        l.name as occ_location_name
+
+      from applications a
+      join positions p on p.id = a.position_id
+      left join users ou on ou.id = p.occupied_by
+      left join roles r on r.id = ou.role_id
+      left join locations l on l.id = ou.location_id
+      where a.user_id = $1
+      order by a.priority asc, a.created_at asc
+      `,
+            [userId]
+        );
+
+        // ricostruiamo una shape compatibile con la vecchia select supabase (minimo necessario)
+        const apps = rows.map((r) => ({
+            id: r.app_id,
+            position_id: r.position_id,
+            priority: r.priority,
+            created_at: r.created_at,
+            positions: {
+                id: r.pos_id,
+                occupied_by: r.occupied_by,
+                users: r.occ_user_id
+                    ? {
+                        id: r.occ_user_id,
+                        full_name: r.occ_full_name,
+                        fixed_location: r.occ_fixed_location,
+                        roles: { name: r.occ_role_name ?? "—" },
+                        locations: { name: r.occ_location_name ?? "—" },
+                    }
+                    : null,
+            },
+        }));
+
+        return res.json({ ok: true, applications: apps, correlationId: (req as any).correlationId ?? null });
+    } catch (err) {
+        next(err);
+    }
+});
 
 /**
  * POST /api/users/me/deactivate
