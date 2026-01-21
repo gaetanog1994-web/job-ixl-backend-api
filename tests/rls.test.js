@@ -1,6 +1,28 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { login } from "./_helpers.js";
+import { makeSupabaseAnon } from "./_helpers.js";
+
+test("RLS positions: anon cannot read", async () => {
+    const sbAnon = makeSupabaseAnon();
+    const { data, error } = await sbAnon.from("positions").select("id").limit(1);
+    assert.ok(error, "expected error for anon read");
+});
+
+test("RLS positions: authenticated cannot insert/update/delete", async () => {
+    const { sb } = await login(process.env.TEST_USER_EMAIL, process.env.TEST_USER_PASSWORD);
+
+    const { data: positions, error: posErr } = await sb.from("positions").select("id").limit(1);
+    assert.equal(posErr, null);
+    assert.ok(positions?.[0]?.id);
+    const id = positions[0].id;
+
+    const upd = await sb.from("positions").update({ title: "HACK" }).eq("id", id);
+    assert.ok(upd.error, "expected update denied");
+
+    const del = await sb.from("positions").delete().eq("id", id);
+    assert.ok(del.error, "expected delete denied");
+});
 
 test("RLS applications: non-admin cannot insert for another user_id", async () => {
     const { sb, userId } = await login(process.env.TEST_USER_EMAIL, process.env.TEST_USER_PASSWORD);
