@@ -621,22 +621,94 @@ adminRouter.get("/users/active", async (req, res, next) => {
     }
 });
 
-adminRouter.get("/users", async (req, res, next) => {
+adminRouter.post("/users", async (req, res, next) => {
     try {
-        const { rows } = await pool.query(`
-      select
-        u.id,
-        u.full_name,
-        u.email,
-        u.availability_status,
-        u.location_id,
-        u.role_id,
-        u.fixed_location
-      from users u
-      order by u.full_name asc
-      limit 500
-    `);
-        return res.json({ ok: true, users: rows, correlationId: (req as any).correlationId ?? null });
+        const correlationId = (req as any).correlationId;
+        const { full_name, email } = req.body ?? {};
+        if (!full_name || !email) {
+            return res.status(400).json({ ok: false, error: "missing full_name/email", correlationId });
+        }
+
+        const { rows } = await pool.query(
+            `
+      insert into users (full_name, email, availability_status)
+      values ($1, $2, 'inactive')
+      returning id, full_name, email, availability_status, location_id, fixed_location, role_id
+      `,
+            [String(full_name), String(email)]
+        );
+
+        invalidateMapCache();
+        return res.status(201).json({ ok: true, user: rows[0], correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.delete("/users/:id", async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const userId = req.params.id;
+
+        // opzionale: cleanup applications del user
+        await pool.query(`delete from applications where user_id = $1`, [userId]);
+
+        const del = await pool.query(`delete from users where id = $1`, [userId]);
+
+        invalidateMapCache();
+        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.patch("/users/:id", async (req, res, next) => {
+    try {
+        const userId = req.params.id;
+        const correlationId = (req as any).correlationId;
+
+        const { availability_status, location_id, fixed_location, role_id } = req.body ?? {};
+
+        const fields: string[] = [];
+        const values: any[] = [];
+        let i = 1;
+
+        const push = (name: string, value: any) => {
+            fields.push(`${name} = $${i++}`);
+            values.push(value);
+        };
+
+        if (availability_status !== undefined) {
+            if (availability_status !== "available" && availability_status !== "inactive") {
+                return res.status(400).json({ ok: false, error: "invalid availability_status", correlationId });
+            }
+            push("availability_status", availability_status);
+        }
+
+        if (location_id !== undefined) push("location_id", location_id || null);
+        if (fixed_location !== undefined) push("fixed_location", !!fixed_location);
+        if (role_id !== undefined) push("role_id", role_id || null);
+
+        if (fields.length === 0) {
+            return res.status(400).json({ ok: false, error: "empty patch", correlationId });
+        }
+
+        values.push(userId);
+
+        const { rows } = await pool.query(
+            `
+      update users
+      set ${fields.join(", ")}
+      where id = $${i}
+      returning id, full_name, email, availability_status, location_id, fixed_location, role_id
+      `,
+            values
+        );
+
+        invalidateMapCache();
+        return res.json({ ok: true, user: rows?.[0] ?? null, correlationId });
     } catch (e) {
         next(e);
     }
@@ -676,66 +748,49 @@ adminRouter.get("/locations", async (req, res, next) => {
 });
 
 
-adminRouter.patch("/users/:id", async (req, res, next) => {
+adminRouter.get("/roles", async (req, res, next) => {
     try {
-        const userId = req.params.id;
-        const correlationId = (req as any).correlationId;
+        const { rows } = await pool.query(`
+      select id, name
+      from roles
+      order by name asc
+      limit 2000
+    `);
+        return res.json({ ok: true, roles: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
 
-        const {
-            availability_status,
-            location_id,
-            fixed_location,
-            role_id,
-        } = req.body ?? {};
 
-        // whitelist patch
-        const fields: string[] = [];
-        const values: any[] = [];
-        let i = 1;
+adminRouter.get("/test-scenarios", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select id, name
+      from test_scenarios
+      order by created_at asc
+      limit 500
+    `);
+        return res.json({ ok: true, scenarios: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
 
-        const pushField = (name: string, value: any) => {
-            fields.push(`${name} = $${i++}`);
-            values.push(value);
-        };
 
-        if (availability_status !== undefined) {
-            if (availability_status !== "available" && availability_status !== "inactive") {
-                return res.status(400).json({ ok: false, error: "invalid availability_status", correlationId });
-            }
-            pushField("availability_status", availability_status);
-        }
-
-        if (location_id !== undefined) {
-            pushField("location_id", location_id || null);
-        }
-
-        if (fixed_location !== undefined) {
-            pushField("fixed_location", !!fixed_location);
-        }
-
-        if (role_id !== undefined) {
-            pushField("role_id", role_id || null);
-        }
-
-        if (fields.length === 0) {
-            return res.status(400).json({ ok: false, error: "empty patch", correlationId });
-        }
-
-        values.push(userId);
-
-        const { rows } = await pool.query(
-            `
-        update users
-        set ${fields.join(", ")}
-        where id = $${i}
-        returning id, full_name, availability_status, location_id, fixed_location, role_id
-      `,
-            values
-        );
-
-        invalidateMapCache();
-
-        return res.json({ ok: true, user: rows?.[0] ?? null, correlationId });
+adminRouter.get("/config", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select max_applications
+      from app_config
+      where singleton = true
+      limit 1
+    `);
+        return res.json({
+            ok: true,
+            config: rows?.[0] ?? null,
+            correlationId: (req as any).correlationId ?? null,
+        });
     } catch (e) {
         next(e);
     }
