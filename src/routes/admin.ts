@@ -674,3 +674,69 @@ adminRouter.get("/locations", async (req, res, next) => {
         next(e);
     }
 });
+
+
+adminRouter.patch("/users/:id", async (req, res, next) => {
+    try {
+        const userId = req.params.id;
+        const correlationId = (req as any).correlationId;
+
+        const {
+            availability_status,
+            location_id,
+            fixed_location,
+            role_id,
+        } = req.body ?? {};
+
+        // whitelist patch
+        const fields: string[] = [];
+        const values: any[] = [];
+        let i = 1;
+
+        const pushField = (name: string, value: any) => {
+            fields.push(`${name} = $${i++}`);
+            values.push(value);
+        };
+
+        if (availability_status !== undefined) {
+            if (availability_status !== "available" && availability_status !== "inactive") {
+                return res.status(400).json({ ok: false, error: "invalid availability_status", correlationId });
+            }
+            pushField("availability_status", availability_status);
+        }
+
+        if (location_id !== undefined) {
+            pushField("location_id", location_id || null);
+        }
+
+        if (fixed_location !== undefined) {
+            pushField("fixed_location", !!fixed_location);
+        }
+
+        if (role_id !== undefined) {
+            pushField("role_id", role_id || null);
+        }
+
+        if (fields.length === 0) {
+            return res.status(400).json({ ok: false, error: "empty patch", correlationId });
+        }
+
+        values.push(userId);
+
+        const { rows } = await pool.query(
+            `
+        update users
+        set ${fields.join(", ")}
+        where id = $${i}
+        returning id, full_name, availability_status, location_id, fixed_location, role_id
+      `,
+            values
+        );
+
+        invalidateMapCache();
+
+        return res.json({ ok: true, user: rows?.[0] ?? null, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
