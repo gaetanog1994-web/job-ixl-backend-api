@@ -602,24 +602,33 @@ adminRouter.get("/candidatures", async (req, res, next) => {
     }
 });
 
-adminRouter.get("/users/active", async (req, res, next) => {
-
+adminRouter.get("/users", async (req, res, next) => {
     try {
         const { rows } = await pool.query(
             `
-      select id, full_name
+      select
+        id,
+        full_name,
+        email,
+        availability_status,
+        location_id,
+        fixed_location,
+        role_id
       from users
-      where availability_status = 'available'
-        and location_id is not null
-      order by full_name asc
+      order by full_name nulls last, id
       `
         );
 
-        return res.json({ ok: true, users: rows, correlationId: (req as any).correlationId ?? null });
+        return res.json({
+            ok: true,
+            users: rows,
+            correlationId: (req as any).correlationId ?? null,
+        });
     } catch (e) {
         next(e);
     }
 });
+
 
 adminRouter.post("/users", async (req, res, next) => {
     try {
