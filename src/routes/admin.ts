@@ -138,6 +138,34 @@ adminRouter.post(
     }
 );
 
+
+adminRouter.post("/users/:id/location", async (req, res, next) => {
+    try {
+        const userId = req.params.id;
+        const { locationId } = req.body ?? {};
+        await pool.query(`update users set location_id = $1 where id = $2`, [locationId ?? null, userId]);
+        return res.json({ ok: true, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.post("/users/:id/status", async (req, res, next) => {
+    try {
+        const userId = req.params.id;
+        const { status } = req.body ?? {};
+        if (!["available", "inactive"].includes(status)) {
+            return res.status(400).json({ ok: false, error: "Invalid status" });
+        }
+        await pool.query(`update users set availability_status = $1 where id = $2`, [status, userId]);
+        return res.json({ ok: true, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
 /**
  * POST /api/admin/users/:id/deactivate
  */
