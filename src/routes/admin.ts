@@ -9,6 +9,8 @@ import { pool } from "../db.js";
 
 export const adminRouter = Router();
 
+adminRouter.use(requireAuth, requireAdmin);
+
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;

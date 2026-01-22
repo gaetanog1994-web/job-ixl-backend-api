@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import type { AuthedRequest } from "./auth.js";
 import type { Request, Response } from "express";
 import { requireAuth, requireAdmin, attachIsAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
