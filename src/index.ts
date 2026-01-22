@@ -13,6 +13,7 @@ import { syncGraphRouter } from "./routes/syncGraph.js";
 import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
+import { publicRouter } from "./routes/public.js";
 
 
 
@@ -64,6 +65,7 @@ app.use(
 app.use("/api/users", requireAuth, usersRouter);
 app.use("/api/map", requireAuth, mapRouter);
 app.use("/api", requireAuth, applicationsRouter);
+app.use("/api/public", publicRouter);
 
 app.get("/api/me", requireAuth, attachIsAdmin, (req, res) => {
     const r = req as any;

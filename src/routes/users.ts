@@ -1,7 +1,6 @@
-import { Router } from "express";
-import type { Request, Response, NextFunction } from "express";
+import type { Router, Request, Response, NextFunction } from "express";
 import { requireAuth, type AuthedRequest } from "../auth.js";
-import { withTx } from "../db.js";
+import { pool, withTx } from "../db.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
 
@@ -9,9 +8,47 @@ import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
 // src/routes/users.ts
 import express from "express";
 
-import { pool } from "../db.js";
-
 export const usersRouter = express.Router();
+
+/**
+ * POST /api/users/me/ensure
+ * Crea/aggiorna la riga in public.users per l'utente loggato.
+ * Serve dopo signUp/login per bootstrap profilo applicativo senza supabase.from nel FE.
+ */
+usersRouter.post("/me/ensure", async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const r = req as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+
+        const { full_name, location_id } = req.body ?? {};
+        const fullName = String(full_name ?? "").trim();
+        const locationId = location_id ? String(location_id) : null;
+
+        if (!fullName) {
+            const e: any = new Error("missing full_name");
+            e.status = 400;
+            throw e;
+        }
+
+        const { rows } = await pool.query(
+            `
+      insert into users (id, email, full_name, location_id, availability_status, application_count)
+      values ($1, $2, $3, $4, 'inactive', 0)
+      on conflict (id) do update
+        set full_name = excluded.full_name,
+            location_id = excluded.location_id
+      returning id, email, full_name, location_id, availability_status, application_count
+      `,
+            [r.user.id, r.user.email ?? null, fullName, locationId]
+        );
+
+        invalidateMapCache();
+        return res.json({ ok: true, user: rows[0], correlationId });
+    } catch (err) {
+        next(err);
+    }
+});
+
 
 usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) => {
     try {
@@ -50,7 +87,7 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
 });
 
 // GET /api/users/me/applications
-usersRouter.get("/me/applications", requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+usersRouter.get("/me/applications", async (req, res, next) => {
     try {
         const userId = (req as any).user?.id;
         if (!userId) {
@@ -119,7 +156,8 @@ usersRouter.get("/me/applications", requireAuth, async (req: Request, res: Respo
  * POST /api/users/me/deactivate
  * Self-service: l'utente diventa "inactive" + cleanup delle sue applications
  */
-usersRouter.post("/me/deactivate", requireAuth, async (req: Request, res: Response) => {
+usersRouter.post("/me/deactivate", async (req, res) => {
+
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
@@ -159,7 +197,8 @@ usersRouter.post("/me/deactivate", requireAuth, async (req: Request, res: Respon
  * POST /api/users/me/activate
  * Self-service: l'utente torna "available"
  */
-usersRouter.post("/me/activate", requireAuth, async (req: Request, res: Response) => {
+usersRouter.post("/me/activate", async (req, res) => {
+
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
