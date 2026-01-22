@@ -574,7 +574,8 @@ adminRouter.get("/candidatures", async (req, res, next) => {
     }
 });
 
-adminRouter.get("/users/active", requireAuth, requireAdmin, async (req, res, next) => {
+adminRouter.get("/users/active", async (req, res, next) => {
+
     try {
         const { rows } = await pool.query(
             `
@@ -631,3 +632,17 @@ adminRouter.get("/positions", async (req, res, next) => {
     }
 });
 
+adminRouter.get("/locations", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select id, name, latitude, longitude
+      from locations
+      order by name asc
+      limit 2000
+    `);
+
+        return res.json({ ok: true, locations: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
