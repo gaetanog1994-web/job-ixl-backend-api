@@ -1,14 +1,15 @@
 import { Router, Request, Response } from "express";
-import { withTx } from "../db.js";
+import { withTx, pool } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
-import { pool } from "../db.js";
+import { requireAuth, requireAdmin } from "../auth.js";
 
 
 export const adminRouter = Router();
 
+adminRouter.use(requireAuth, requireAdmin);
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -93,14 +94,17 @@ adminRouter.post(
                 // 5) riallinea application_count (consistenza)
                 await client.query(`
                     update users u
-                    set application_count = coalesce(a.cnt, 0)
+                    set application_count = coalesce(x.cnt, 0)
                     from (
-                        select user_id, count(*)::int as cnt
-                        from applications
-                        group by user_id
-                    ) a
-                    where u.id = a.user_id
-                `);
+                        select u2.id as user_id, count(a.*)::int as cnt
+                        from users u2
+                        left join applications a on a.user_id = u2.id
+                        group by u2.id
+                    ) x
+                    where u.id = x.user_id
+                    `
+                );
+
 
                 await client.query(`
                     update users
@@ -139,31 +143,6 @@ adminRouter.post(
 );
 
 
-adminRouter.post("/users/:id/location", async (req, res, next) => {
-    try {
-        const userId = req.params.id;
-        const { locationId } = req.body ?? {};
-        await pool.query(`update users set location_id = $1 where id = $2`, [locationId ?? null, userId]);
-        return res.json({ ok: true, correlationId: (req as any).correlationId ?? null });
-    } catch (e) {
-        next(e);
-    }
-});
-
-
-adminRouter.post("/users/:id/status", async (req, res, next) => {
-    try {
-        const userId = req.params.id;
-        const { status } = req.body ?? {};
-        if (!["available", "inactive"].includes(status)) {
-            return res.status(400).json({ ok: false, error: "Invalid status" });
-        }
-        await pool.query(`update users set availability_status = $1 where id = $2`, [status, userId]);
-        return res.json({ ok: true, correlationId: (req as any).correlationId ?? null });
-    } catch (e) {
-        next(e);
-    }
-});
 
 
 /**
@@ -300,17 +279,6 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
         `
             );
 
-            // 5) riallinea application_count (consistenza)
-            await client.query(`
-        update users u
-        set application_count = coalesce(a.cnt, 0)
-        from (
-          select user_id, count(*)::int as cnt
-          from applications
-          group by user_id
-        ) a
-        where u.id = a.user_id
-      `);
 
             await client.query(`
         update users
