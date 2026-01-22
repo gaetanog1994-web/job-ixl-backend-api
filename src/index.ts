@@ -216,3 +216,16 @@ app.listen(PORT, "0.0.0.0", () => {
 });
 
 
+app.get("/api/config", requireAuth, async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select max_applications
+      from app_config
+      where singleton = true
+      limit 1
+    `);
+        return res.json({ ok: true, config: rows?.[0] ?? null, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});

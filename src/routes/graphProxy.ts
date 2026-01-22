@@ -13,18 +13,16 @@ if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
 graphProxyRouter.use(async (req: Request, res: Response) => {
     try {
         const base = GRAPH_SERVICE_URL.replace(/\/+$/, "");
-        const forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "");
-        const url = `${base}${forwardPath || "/"}`;
+        let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
 
-        const headers: Record<string, string> = {
-            "x-graph-token": GRAPH_SERVICE_TOKEN,
-        };
+        // RC1: warmup non esiste sul graph-engine → alias a /health
+        if (forwardPath === "/warmup") forwardPath = "/health";
 
-        // Copia content-type se presente
+        const headers: Record<string, string> = { "x-graph-token": GRAPH_SERVICE_TOKEN };
+
         const ct = req.headers["content-type"];
         if (typeof ct === "string") headers["content-type"] = ct;
 
-        // Copia anche accept se vuoi (non necessario)
         const accept = req.headers["accept"];
         if (typeof accept === "string") headers["accept"] = accept;
 
@@ -34,17 +32,32 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
                 ? undefined
                 : (req.body ? JSON.stringify(req.body) : undefined);
 
-        const resp = await fetch(url, { method, headers, body });
+        async function doFetch(path: string) {
+            const url = `${base}${path}`;
+            return fetch(url, { method, headers, body });
+        }
+
+        // 1) prima prova
+        let resp = await doFetch(forwardPath);
+
+        // 2) fallback /api se 404 (utile per future routes)
+        if (resp.status === 404 && !forwardPath.startsWith("/api/")) {
+            resp = await doFetch(`/api${forwardPath}`);
+        }
 
         const text = await resp.text();
-
         res.status(resp.status);
-        // inoltra content-type del server se presente
+
         const respCt = resp.headers.get("content-type");
         if (respCt) res.setHeader("content-type", respCt);
 
         return res.send(text);
     } catch (e: any) {
-        return res.status(502).json({ error: "Graph proxy failed", detail: String(e?.message ?? e) });
+        return res.status(502).json({
+            ok: false,
+            error: { code: "GRAPH_PROXY_FAILED", message: "Graph proxy failed", detail: String(e?.message ?? e) },
+            correlationId: (req as any).correlationId ?? null,
+        });
     }
 });
+
