@@ -24,7 +24,7 @@ export const syncGraphRouter = Router();
  * - backend-api costruisce dataset da Supabase (source of truth)
  * - graph-engine esegue build-graph (token-only)
  */
-syncGraphRouter.post("/sync-graph", async (req: Request, res: Response) => {
+syncGraphRouter.post("/", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
     try {
         // 1) Leggi applications (source of truth)

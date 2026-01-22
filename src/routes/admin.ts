@@ -4,12 +4,10 @@ import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
-import { requireAuth, requireAdmin } from "../auth.js";
 
 
 export const adminRouter = Router();
 
-adminRouter.use(requireAuth, requireAdmin);
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -19,9 +17,7 @@ const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;
 if (!GRAPH_SERVICE_URL) throw new Error("Missing GRAPH_SERVICE_URL");
 if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
 
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-    auth: { persistSession: false, autoRefreshToken: false },
-});
+
 
 /**
  * POST /api/admin/test-scenarios/:id/initialize
@@ -29,7 +25,8 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 adminRouter.post(
     "/test-scenarios/:id/initialize",
     async (req: Request, res: Response) => {
-        const r = req as AuthedRequest;
+        const r = req as unknown as AuthedRequest;
+        ;
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
 
@@ -151,7 +148,7 @@ adminRouter.post(
 adminRouter.post(
     "/users/:id/deactivate",
     async (req: Request, res: Response) => {
-        const r = req as AuthedRequest;
+        const r = req as unknown as AuthedRequest;
         const userId = req.params.id;
         const correlationId = (req as any).correlationId;
 
@@ -195,7 +192,7 @@ adminRouter.post(
  * Product rule: niente logica nel DB (no trigger), tutto in backend.
  */
 adminRouter.post("/config/max-applications", async (req: Request, res: Response) => {
-    const r = req as AuthedRequest;
+    const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
     try {
@@ -325,158 +322,6 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
     }
 });
 
-/**
- * POST /api/admin/sync-graph
- * Rebuild completo del grafo Neo4j (on-demand, admin-only)
- */
-adminRouter.post("/sync-graph", async (req, res) => {
-
-    const r = req as AuthedRequest;
-    const correlationId = (req as any).correlationId;
-
-    try {
-        // 1) Leggi applications
-        const { data: apps, error: appsErr } = await supabaseAdmin
-            .from("applications")
-            .select("user_id, position_id, priority");
-
-        if (appsErr) {
-            return res.status(500).json({ error: appsErr.message, correlationId });
-        }
-
-        const positionIds = Array.from(
-            new Set((apps ?? []).map(a => a.position_id).filter(Boolean))
-        );
-
-        // 2) Leggi positions → occupied_by
-        const { data: positions, error: posErr } = await supabaseAdmin
-            .from("positions")
-            .select("id, occupied_by")
-            .in("id", positionIds);
-
-        if (posErr) {
-            return res.status(500).json({ error: posErr.message, correlationId });
-        }
-
-        const posToOccupant = new Map((positions ?? []).map(p => [p.id, p.occupied_by]));
-
-        const edges = (apps ?? [])
-            .map(a => ({
-                user_id: a.user_id,
-                target_user_id: posToOccupant.get(a.position_id) ?? null,
-                priority: a.priority ?? null,
-            }))
-            .filter(e => e.user_id && e.target_user_id);
-
-        // 3) usersById
-        const userIds = Array.from(
-            new Set(edges.flatMap(e => [e.user_id, e.target_user_id]).filter(Boolean))
-        );
-
-        const { data: users, error: usersErr } = await supabaseAdmin
-            .from("users")
-            .select("id, full_name")
-            .in("id", userIds);
-
-        if (usersErr) {
-            return res.status(500).json({ error: usersErr.message, correlationId });
-        }
-
-        const usersById: Record<string, string> = {};
-        for (const u of users ?? []) {
-            usersById[u.id] = u.full_name ?? u.id;
-        }
-
-        // 4) Warmup Neo4j (best effort)
-        try {
-            await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
-                method: "POST",
-                headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
-            });
-        } catch { }
-
-        // 5) Build graph
-        const buildRes = await fetch(new URL("/build-graph", GRAPH_SERVICE_URL).toString(), {
-            method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                "x-graph-token": GRAPH_SERVICE_TOKEN,
-            },
-            body: JSON.stringify({ applications: edges, usersById }),
-        });
-
-        const buildJson = await buildRes.json().catch(() => null);
-
-        if (!buildRes.ok) {
-            return res.status(502).json({
-                error: "Graph engine build-graph failed",
-                engineStatus: buildRes.status,
-                engineBody: buildJson,
-                correlationId,
-            });
-        }
-
-        await audit(
-            "graph_sync",
-            r.user.id,
-            { edges: edges.length },
-            buildJson,
-            correlationId
-        );
-
-        return res.status(200).json({
-            ok: true,
-            correlationId,
-            dataset: {
-                applicationsRead: apps?.length ?? 0,
-                edgesBuilt: edges.length,
-                usersMapped: Object.keys(usersById).length,
-            },
-            engine: buildJson,
-        });
-
-    } catch (e: any) {
-        return res.status(500).json({ error: e?.message ?? String(e), correlationId });
-    }
-});
-
-
-adminRouter.post("/graph/summary", async (req: Request, res: Response) => {
-    const correlationId = (req as any).correlationId;
-
-    const resp = await fetch(new URL("/graph/summary", GRAPH_SERVICE_URL).toString(), {
-        method: "POST",
-        headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
-    });
-
-    const body = await resp.text();
-    res.status(resp.status).type(resp.headers.get("content-type") ?? "application/json").send(body);
-});
-
-
-adminRouter.post("/graph/chains", async (req: Request, res: Response) => {
-    const correlationId = (req as any).correlationId;
-
-    const resp = await fetch(new URL("/graph/chains", GRAPH_SERVICE_URL).toString(), {
-        method: "POST",
-        headers: { "x-graph-token": GRAPH_SERVICE_TOKEN, "content-type": "application/json" },
-        body: JSON.stringify(req.body ?? {}),
-    });
-
-    const body = await resp.text();
-    res.status(resp.status).type(resp.headers.get("content-type") ?? "application/json").send(body);
-});
-
-
-adminRouter.post("/graph/warmup", async (req: Request, res: Response) => {
-    const resp = await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
-        method: "POST",
-        headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
-    });
-
-    const body = await resp.text();
-    res.status(resp.status).type(resp.headers.get("content-type") ?? "application/json").send(body);
-});
 
 
 /**
@@ -485,7 +330,7 @@ adminRouter.post("/graph/warmup", async (req: Request, res: Response) => {
  */
 adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
 
-    const r = req as AuthedRequest;
+    const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
     try {
@@ -755,6 +600,171 @@ adminRouter.get("/test-scenarios", async (req, res, next) => {
 });
 
 
+/**
+ * GET /api/admin/test-scenarios/:id/applications
+ * Lista applications dello scenario
+ */
+adminRouter.get("/test-scenarios/:id/applications", async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const scenarioId = req.params.id;
+
+        const { rows } = await pool.query(
+            `
+      select
+        id,
+        user_id,
+        position_id,
+        priority
+      from test_scenario_applications
+      where scenario_id = $1
+      order by priority asc, created_at asc nulls last, id asc
+      `,
+            [scenarioId]
+        );
+
+        return res.json({ ok: true, applications: rows, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * PATCH /api/admin/test-scenarios/:id
+ * Rename scenario
+ * body: { name }
+ */
+adminRouter.patch("/test-scenarios/:id", async (req: Request, res: Response, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+
+        const correlationId = (req as any).correlationId;
+        const scenarioId = req.params.id;
+
+        const name = String((req as any).body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing name", correlationId });
+        }
+
+        const { rows } = await pool.query(
+            `
+      update test_scenarios
+      set name = $1
+      where id = $2
+      returning id, name
+      `,
+            [name, scenarioId]
+        );
+
+        const scenario = rows?.[0] ?? null;
+
+        await audit("scenario_rename", r.user.id, { scenarioId }, { scenario }, correlationId);
+
+        return res.json({ ok: true, scenario, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+/**
+ * DELETE /api/admin/test-scenarios/:id
+ * Delete scenario + cascade applications
+ */
+adminRouter.delete("/test-scenarios/:id", async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    const scenarioId = req.params.id;
+
+    try {
+        const out = await withTx(async (client) => {
+            const delApps = await client.query(
+                `delete from test_scenario_applications where scenario_id = $1`,
+                [scenarioId]
+            );
+            const delScenario = await client.query(
+                `delete from test_scenarios where id = $1`,
+                [scenarioId]
+            );
+
+            return {
+                scenarioId,
+                applicationsDeleted: delApps.rowCount ?? 0,
+                scenariosDeleted: delScenario.rowCount ?? 0,
+            };
+        });
+
+        await audit("scenario_delete", r.user.id, { scenarioId }, out, correlationId);
+
+        return res.json({ ok: true, out, correlationId });
+    } catch (e: any) {
+        await audit(
+            "scenario_delete",
+            r.user.id,
+            { scenarioId },
+            { error: String(e?.message ?? e) },
+            correlationId
+        );
+
+        return res.status(500).json({ ok: false, error: "Delete scenario failed", correlationId });
+    }
+});
+
+/**
+ * DELETE /api/admin/test-scenarios/:id/applications/:appId
+ * Delete one application inside scenario
+ */
+adminRouter.delete("/test-scenarios/:id/applications/:appId", async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId;
+
+        const scenarioId = req.params.id;
+        const appId = req.params.appId;
+
+        const del = await pool.query(
+            `
+      delete from test_scenario_applications
+      where id = $1 and scenario_id = $2
+      `,
+            [appId, scenarioId]
+        );
+
+        const out = { scenarioId, appId, deleted: del.rowCount ?? 0 };
+        await audit("scenario_application_delete", r.user.id, { scenarioId, appId }, out, correlationId);
+
+        return res.json({ ok: true, out, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * DELETE /api/admin/test-scenarios/:id/applications
+ * Delete all applications for scenario
+ */
+adminRouter.delete("/test-scenarios/:id/applications", async (req: Request, res: Response, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId;
+
+        const scenarioId = req.params.id;
+
+        const del = await pool.query(
+            `delete from test_scenario_applications where scenario_id = $1`,
+            [scenarioId]
+        );
+
+        const out = { scenarioId, deleted: del.rowCount ?? 0 };
+        await audit("scenario_applications_delete_all", r.user.id, { scenarioId }, out, correlationId);
+
+        return res.json({ ok: true, out, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
 adminRouter.get("/config", async (req, res, next) => {
     try {
         const { rows } = await pool.query(`
@@ -833,3 +843,72 @@ adminRouter.delete("/roles/:id", async (req, res, next) => {
         next(e);
     }
 });
+
+
+/**
+ * POST /api/admin/test-scenarios
+ * Crea scenario
+ * body: { name }
+ */
+adminRouter.post("/test-scenarios", async (req: Request, res: Response, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+
+        const correlationId = (req as any).correlationId;
+        const name = String((req as any).body?.name ?? "").trim();
+        if (!name) return res.status(400).json({ ok: false, error: "missing name", correlationId });
+
+        const { rows } = await pool.query(
+            `insert into test_scenarios (name) values ($1) returning id, name`,
+            [name]
+        );
+
+        const scenario = rows[0];
+        await audit("scenario_create", r.user.id, { name }, { scenario }, correlationId);
+
+        return res.status(201).json({ ok: true, scenario, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+/**
+ * POST /api/admin/test-scenarios/:id/applications
+ * Inserisce candidatura nello scenario
+ * body: { user_id, position_id, priority }
+ */
+adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: Response, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+
+        const correlationId = (req as any).correlationId;
+        const scenarioId = req.params.id;
+
+        const user_id = String((req as any).body?.user_id ?? "");
+        const position_id = String((req as any).body?.position_id ?? "");
+        const priority = Number((req as any).body?.priority ?? 1);
+
+        if (!user_id || !position_id || !Number.isFinite(priority) || priority < 1) {
+            return res.status(400).json({ ok: false, error: "invalid body", correlationId });
+        }
+
+        const { rows } = await pool.query(
+            `
+      insert into test_scenario_applications (scenario_id, user_id, position_id, priority)
+      values ($1, $2, $3, $4)
+      returning id, scenario_id, user_id, position_id, priority
+      `,
+            [scenarioId, user_id, position_id, priority]
+        );
+
+        const application = rows[0];
+        await audit("scenario_application_create", r.user.id, { scenarioId }, { application }, correlationId);
+
+        return res.status(201).json({ ok: true, application, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
