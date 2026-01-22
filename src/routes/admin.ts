@@ -1,6 +1,6 @@
 import { Router, Request, Response } from "express";
 import { withTx } from "../db.js";
-import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
+import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
@@ -9,7 +9,6 @@ import { pool } from "../db.js";
 
 export const adminRouter = Router();
 
-adminRouter.use(requireAuth, requireAdmin);
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -334,7 +333,8 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
  * POST /api/admin/sync-graph
  * Rebuild completo del grafo Neo4j (on-demand, admin-only)
  */
-adminRouter.post("/sync-graph", requireAuth, requireAdmin, async (req: Request, res: Response) => {
+adminRouter.post("/sync-graph", async (req, res) => {
+
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
