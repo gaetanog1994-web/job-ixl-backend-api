@@ -589,3 +589,43 @@ adminRouter.get("/users/active", requireAuth, requireAdmin, async (req, res, nex
         next(e);
     }
 });
+
+adminRouter.get("/users", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select
+        u.id,
+        u.full_name,
+        u.email,
+        u.availability_status,
+        u.location_id,
+        u.role_id,
+        u.fixed_location
+      from users u
+      order by u.full_name asc
+      limit 500
+    `);
+        return res.json({ ok: true, users: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.get("/positions", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select
+        p.id,
+        p.title,
+        p.occupied_by
+      from positions p
+      order by p.title asc
+      limit 1000
+    `);
+        return res.json({ ok: true, positions: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
