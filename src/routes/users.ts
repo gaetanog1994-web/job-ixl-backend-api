@@ -152,6 +152,42 @@ usersRouter.get("/me/applications", async (req, res, next) => {
     }
 });
 
+usersRouter.post("/me/ensure", requireAuth, async (req: Request, res: Response, next: NextFunction) => {
+    try {
+        const userId = (req as any).user?.id;
+        if (!userId) {
+            const e: any = new Error("Missing authed user");
+            e.status = 401;
+            throw e;
+        }
+
+        const { full_name, location_id } = req.body ?? {};
+        if (!full_name || typeof full_name !== "string") {
+            const e: any = new Error("Missing full_name");
+            e.status = 400;
+            throw e;
+        }
+
+        // upsert profilo applicativo
+        const { rows } = await pool.query(
+            `
+      insert into users (id, full_name, location_id, availability_status, application_count)
+      values ($1, $2, $3, 'inactive', 0)
+      on conflict (id) do update
+        set full_name = excluded.full_name,
+            location_id = excluded.location_id
+      returning id, email, full_name, location_id, availability_status, role_id, fixed_location
+      `,
+            [userId, full_name, location_id ?? null]
+        );
+
+        return res.json({ ok: true, user: rows[0], correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
 /**
  * POST /api/users/me/deactivate
  * Self-service: l'utente diventa "inactive" + cleanup delle sue applications

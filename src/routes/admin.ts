@@ -772,3 +772,64 @@ adminRouter.get("/config", async (req, res, next) => {
         next(e);
     }
 });
+
+adminRouter.post("/locations", async (req, res, next) => {
+    try {
+        const { name, latitude, longitude } = req.body ?? {};
+        if (!name) return res.status(400).json({ ok: false, error: "missing name" });
+
+        const { rows } = await pool.query(
+            `insert into locations (name, latitude, longitude)
+       values ($1, $2, $3)
+       returning id, name, latitude, longitude`,
+            [String(name), latitude ?? null, longitude ?? null]
+        );
+
+        invalidateMapCache();
+        return res.status(201).json({ ok: true, location: rows[0], correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.delete("/locations/:id", async (req, res, next) => {
+    try {
+        const id = req.params.id;
+        const del = await pool.query(`delete from locations where id = $1`, [id]);
+        invalidateMapCache();
+        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.post("/roles", async (req, res, next) => {
+    try {
+        const { name } = req.body ?? {};
+        if (!name) return res.status(400).json({ ok: false, error: "missing name" });
+
+        const { rows } = await pool.query(
+            `insert into roles (name) values ($1) returning id, name`,
+            [String(name)]
+        );
+
+        invalidateMapCache();
+        return res.status(201).json({ ok: true, role: rows[0], correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
+adminRouter.delete("/roles/:id", async (req, res, next) => {
+    try {
+        const id = req.params.id;
+        const del = await pool.query(`delete from roles where id = $1`, [id]);
+        invalidateMapCache();
+        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
