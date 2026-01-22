@@ -140,6 +140,37 @@ adminRouter.post(
 );
 
 
+/**
+ * GET /api/admin/users/active
+ * Ritorna utenti "attivi" per la sezione Mappe utenti attivi (admin)
+ */
+adminRouter.get("/users/active", async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(
+            `
+      select
+        id,
+        full_name,
+        email,
+        availability_status,
+        location_id,
+        fixed_location,
+        role_id
+      from users
+      where availability_status = 'available'
+      order by full_name nulls last, id
+      `
+        );
+
+        return res.json({
+            ok: true,
+            users: rows,
+            correlationId: (req as any).correlationId ?? null,
+        });
+    } catch (e) {
+        next(e);
+    }
+});
 
 
 /**
