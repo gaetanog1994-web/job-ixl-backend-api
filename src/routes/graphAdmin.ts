@@ -89,17 +89,12 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
         // 3) Shape compatibile (minimo). "optimalChains" = placeholder (uguale a chains) per RC1.
         const chains = cycles.map((c) => ({
             length: c.length,
-            users: c,              // ids in ordine di ciclo
-            // puoi estendere: priorities, edges, ecc.
+            users: c,
         }));
 
-        // 1) raccogli tutti gli userId coinvolti
-        const allUserIds = Array.from(
-            new Set(chains.flatMap((c: any) => c.users))
-        );
+        const allUserIds = Array.from(new Set(chains.flatMap((c: any) => c.users)));
 
-        // 2) carica i nomi da Postgres (source of truth)
-        const { rows } = await pool.query(
+        const { rows: userRows } = await pool.query(
             `
   select id, full_name
   from users
@@ -108,16 +103,21 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
             [allUserIds]
         );
 
-        // 3) mappa id → nome
-        const usersById = Object.fromEntries(
-            rows.map(r => [r.id, r.full_name ?? r.id])
+        const usersById: Record<string, string> = Object.fromEntries(
+            userRows.map((r: any) => [String(r.id), r.full_name ?? String(r.id)])
         );
 
-        // 4) arricchisci le chains
         const enrichedChains = chains.map((c: any) => ({
             ...c,
             peopleNames: c.users.map((id: string) => usersById[id] ?? id),
         }));
+
+        const summary = {
+            edges: rows.length,
+            nodes: nodes.length,
+            chainsFound: enrichedChains.length,
+            maxLen: MAX_CYCLE_LEN,
+        };
 
         return res.json({
             ok: true,
@@ -125,6 +125,7 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
             chains: enrichedChains,
             correlationId,
         });
+
 
     } catch (e) {
         next(e);
