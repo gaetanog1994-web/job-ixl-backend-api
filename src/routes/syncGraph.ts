@@ -79,13 +79,14 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
         // 4) Chiama graph-engine: warmup (best-effort) + build-graph
         // warmup (non blocca)
         try {
-            await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
-                method: "POST",
+            await fetch(new URL("/health", GRAPH_SERVICE_URL).toString(), {
+                method: "GET",
                 headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
             });
         } catch {
             // ignore
         }
+
 
         const buildRes = await fetch(new URL("/build-graph", GRAPH_SERVICE_URL).toString(), {
             method: "POST",
