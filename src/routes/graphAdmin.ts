@@ -93,18 +93,39 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
             // puoi estendere: priorities, edges, ecc.
         }));
 
+        // 1) raccogli tutti gli userId coinvolti
+        const allUserIds = Array.from(
+            new Set(chains.flatMap((c: any) => c.users))
+        );
+
+        // 2) carica i nomi da Postgres (source of truth)
+        const { rows } = await pool.query(
+            `
+  select id, full_name
+  from users
+  where id = any($1)
+  `,
+            [allUserIds]
+        );
+
+        // 3) mappa id → nome
+        const usersById = Object.fromEntries(
+            rows.map(r => [r.id, r.full_name ?? r.id])
+        );
+
+        // 4) arricchisci le chains
+        const enrichedChains = chains.map((c: any) => ({
+            ...c,
+            peopleNames: c.users.map((id: string) => usersById[id] ?? id),
+        }));
+
         return res.json({
             ok: true,
+            summary,
+            chains: enrichedChains,
             correlationId,
-            summary: {
-                edges: rows.length,
-                nodes: nodes.length,
-                chainsFound: chains.length,
-                maxLen: MAX_CYCLE_LEN,
-            },
-            chains,
-            optimalChains: chains, // RC1: stessa lista finché non implementiamo MIS/set-packing
         });
+
     } catch (e) {
         next(e);
     }
