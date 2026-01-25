@@ -27,6 +27,16 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
   `
         );
 
+        const edgePriority = new Map<string, number>();
+
+        for (const r of rows) {
+            const u = String(r.user_id);
+            const v = String(r.target_user_id);
+            const p = Number(r.priority ?? 999);
+            edgePriority.set(`${u}->${v}`, p);
+        }
+
+
         const prioByEdge = new Map<string, number>();
 
         for (const r of rows as any[]) {
@@ -101,26 +111,22 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
 
         // 3) Shape compatibile (minimo). "optimalChains" = placeholder (uguale a chains) per RC1.
         const chains = cycles.map((c) => {
-            const edgePriorities: number[] = [];
-
+            const ps: number[] = [];
             for (let i = 0; i < c.length; i++) {
                 const u = c[i];
                 const v = c[(i + 1) % c.length]; // chiusura ciclo
-                edgePriorities.push(prioByEdge.get(`${u}->${v}`) ?? 999);
+                const p = edgePriority.get(`${u}->${v}`) ?? 999;
+                ps.push(p);
             }
-
-            const avgPriority =
-                edgePriorities.length > 0
-                    ? edgePriorities.reduce((a, b) => a + b, 0) / edgePriorities.length
-                    : null;
+            const avgPriority = ps.length ? ps.reduce((a, b) => a + b, 0) / ps.length : null;
 
             return {
                 length: c.length,
                 users: c,
-                avgPriority,          // ✅ ORA ESISTE
-                edgePriorities,       // (opzionale, utile debug)
+                avgPriority,
             };
         });
+
 
 
         const allUserIds = Array.from(new Set(chains.flatMap((c: any) => c.users)));
