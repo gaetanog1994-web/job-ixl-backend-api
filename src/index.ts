@@ -14,7 +14,7 @@ import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
 import { publicRouter } from "./routes/public.js";
-
+import { graphAdminRouter } from "./routes/graphAdmin.js";
 
 
 
@@ -135,19 +135,19 @@ const adminLimiter = rateLimit({
 // ✅ Un solo "admin stack" senza duplicazioni
 const adminApi = express.Router();
 
-// Ordine importante:
-// 1) requireAuth -> setta req.user
-// 2) rateLimit -> usa req.user.id come key
-// 3) requireAdmin -> RBAC app_admins
+
 adminApi.use(requireAuth, adminLimiter, requireAdmin);
 
-// rotte admin “normali”
+// 1) rotte admin “normali”
 adminApi.use("/", adminRouter);
 
-// graph sync
+// 2) graph sync
 adminApi.use("/sync-graph", syncGraphRouter);
 
-// graph proxy (warmup/chains/...)
+// 3) (RC1) graph chains server-side (non proxy)
+adminApi.use("/graph", graphAdminRouter);
+
+// 4)graph proxy (warmup/chains/...)
 adminApi.use("/graph", graphProxyRouter);
 
 // mount unico

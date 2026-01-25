@@ -4,9 +4,11 @@ import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { createClient } from "@supabase/supabase-js";
 import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
+import { graphAdminRouter } from "./graphAdmin.js";
 
 
 export const adminRouter = Router();
+adminRouter.use("/graph", graphAdminRouter);
 
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;

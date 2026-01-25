@@ -30,7 +30,7 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
         const body =
             method === "GET" || method === "HEAD"
                 ? undefined
-                : (req.body ? JSON.stringify(req.body) : undefined);
+                : (req.body ? JSON.stringify(req.body) : "{}");
 
         async function doFetch(path: string) {
             const url = `${base}${path}`;
