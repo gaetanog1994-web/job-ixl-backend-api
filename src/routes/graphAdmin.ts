@@ -15,16 +15,27 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
         // 1) Build edges user_id -> target_user_id dal DB (applications + positions.occupied_by)
         const { rows } = await pool.query(
             `
-      select
-        a.user_id,
-        p.occupied_by as target_user_id,
-        coalesce(a.priority, 999) as priority
-      from applications a
-      join positions p on p.id = a.position_id
-      where p.occupied_by is not null
-        and a.user_id is not null
-      `
+  select
+    a.user_id,
+    a.position_id,
+    p.occupied_by as target_user_id,
+    coalesce(a.priority, 999) as priority
+  from applications a
+  join positions p on p.id = a.position_id
+  where p.occupied_by is not null
+    and a.user_id is not null
+  `
         );
+
+        const prioByEdge = new Map<string, number>();
+
+        for (const r of rows as any[]) {
+            const u = String(r.user_id);
+            const v = String(r.target_user_id);
+            const p = Number(r.priority ?? 999);
+            prioByEdge.set(`${u}->${v}`, p);
+        }
+
 
         // Adjacency list: user -> [target...]
         const adj = new Map<string, string[]>();
@@ -87,10 +98,28 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
         }
 
         // 3) Shape compatibile (minimo). "optimalChains" = placeholder (uguale a chains) per RC1.
-        const chains = cycles.map((c) => ({
-            length: c.length,
-            users: c,
-        }));
+        const chains = cycles.map((c) => {
+            const edgePriorities: number[] = [];
+
+            for (let i = 0; i < c.length; i++) {
+                const u = c[i];
+                const v = c[(i + 1) % c.length]; // chiusura ciclo
+                edgePriorities.push(prioByEdge.get(`${u}->${v}`) ?? 999);
+            }
+
+            const avgPriority =
+                edgePriorities.length > 0
+                    ? edgePriorities.reduce((a, b) => a + b, 0) / edgePriorities.length
+                    : null;
+
+            return {
+                length: c.length,
+                users: c,
+                avgPriority,          // ✅ ORA ESISTE
+                edgePriorities,       // (opzionale, utile debug)
+            };
+        });
+
 
         const allUserIds = Array.from(new Set(chains.flatMap((c: any) => c.users)));
 
