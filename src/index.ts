@@ -75,6 +75,25 @@ app.get("/api/me", requireAuth, attachIsAdmin, (req, res) => {
     });
 });
 
+app.get("/api/config", requireAuth, async (req, res, next) => {
+    try {
+        const { rows } = await pool.query(`
+      select max_applications
+      from app_config
+      where singleton = true
+      limit 1
+    `);
+        return res.json({
+            ok: true,
+            config: rows?.[0] ?? null,
+            correlationId: (req as any).correlationId ?? null,
+        });
+    } catch (e) {
+        next(e);
+    }
+});
+
+
 // Health pubblico (no auth)
 app.get("/health", async (_req: express.Request, res: express.Response) => {
     try {
