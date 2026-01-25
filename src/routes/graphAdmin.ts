@@ -48,7 +48,7 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
 
         // 2) Find simple cycles (Johnson-lite per digrafo con outdegree ridotto)
         // RC1 pragmatico: DFS da ogni nodo, limita lunghezza per evitare esplosione.
-        const MAX_CYCLE_LEN = Number((req.body?.maxLen ?? 8)) || 8;
+        const MAX_CYCLE_LEN = Number((req.body?.maxLen ?? 40)) || 8;
 
         const nodes = Array.from(adj.keys()).sort();
         const cycles: string[][] = [];
