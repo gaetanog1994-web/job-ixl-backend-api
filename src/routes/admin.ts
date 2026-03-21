@@ -2,24 +2,17 @@ import { Router, Request, Response } from "express";
 import { withTx, pool } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
-import { createClient } from "@supabase/supabase-js";
-import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
+import { invalidateMapCache } from "./map.js";
 import { graphAdminRouter } from "./graphAdmin.js";
-
 
 export const adminRouter = Router();
 adminRouter.use("/graph", graphAdminRouter);
 
-
-const SUPABASE_URL = process.env.SUPABASE_URL!;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;
 
 if (!GRAPH_SERVICE_URL) throw new Error("Missing GRAPH_SERVICE_URL");
 if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
-
-
 
 /**
  * POST /api/admin/test-scenarios/:id/initialize
@@ -28,13 +21,11 @@ adminRouter.post(
     "/test-scenarios/:id/initialize",
     async (req: Request, res: Response) => {
         const r = req as unknown as AuthedRequest;
-        ;
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
 
         try {
             const result = await withTx(async (client) => {
-                // 1) leggi scenario
                 const rows = await client.query(
                     `
             select user_id, position_id, priority
@@ -44,7 +35,6 @@ adminRouter.post(
                     [scenarioId]
                 );
 
-                // 2) reset stato
                 await client.query(`
                     update users
                     set availability_status = 'inactive',
@@ -52,7 +42,6 @@ adminRouter.post(
                 `);
                 await client.query(`delete from applications`);
 
-                // 3) inserisci applications
                 await client.query(
                     `
             insert into applications (user_id, position_id, priority)
@@ -63,22 +52,17 @@ adminRouter.post(
                     [scenarioId]
                 );
 
-                // 4) riattiva utenti coinvolti:
-                // - candidati (user_id)
-                // - target (occupanti delle posizioni a cui ci si candida)
                 await client.query(
                     `
                   update users
                   set availability_status = 'available'
                   where id in (
-                -- candidati
                 select distinct user_id
                 from test_scenario_applications
                 where scenario_id = $1
 
                 union
 
-                -- occupanti delle posizioni target
                 select distinct p.occupied_by
                 from test_scenario_applications tsa
                 join positions p on p.id = tsa.position_id
@@ -89,8 +73,6 @@ adminRouter.post(
                     [scenarioId]
                 );
 
-
-                // 5) riallinea application_count (consistenza)
                 await client.query(`
                     update users u
                     set application_count = coalesce(x.cnt, 0)
@@ -104,19 +86,18 @@ adminRouter.post(
                     `
                 );
 
-
                 await client.query(`
                     update users
                     set application_count = 0
                     where id not in (select distinct user_id from applications)
                 `);
 
-
                 return {
                     insertedApplications: rows.rowCount,
                     activatedUsers: rows.rowCount,
                 };
             });
+
             invalidateMapCache();
 
             await audit(
@@ -141,10 +122,8 @@ adminRouter.post(
     }
 );
 
-
 /**
  * GET /api/admin/users/active
- * Ritorna utenti "attivi" per la sezione Mappe utenti attivi (admin)
  */
 adminRouter.get("/users/active", async (req, res, next) => {
     try {
@@ -174,7 +153,6 @@ adminRouter.get("/users/active", async (req, res, next) => {
     }
 });
 
-
 /**
  * POST /api/admin/users/:id/deactivate
  */
@@ -195,6 +173,7 @@ adminRouter.post(
                 ]);
                 return { deactivatedUserId: userId };
             });
+
             invalidateMapCache();
 
             await audit(
@@ -221,8 +200,6 @@ adminRouter.post(
 
 /**
  * POST /api/admin/config/max-applications
- * Aggiorna max_applications (singleton) e ribilancia le applications in modo deterministico.
- * Product rule: niente logica nel DB (no trigger), tutto in backend.
  */
 adminRouter.post("/config/max-applications", async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
@@ -240,19 +217,16 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
         }
 
         const out = await withTx(async (client) => {
-            // 1) leggi old max (singleton)
             const oldRow = await client.query(
                 `select max_applications from app_config where singleton = true limit 1`
             );
             const oldMax: number | null = oldRow.rows?.[0]?.max_applications ?? null;
 
-            // 2) aggiorna config
-            const upd = await client.query(
+            await client.query(
                 `update app_config set max_applications = $1 where singleton = true`,
                 [newMax]
             );
 
-            // 3) se max aumenta o non cambia → nessun rebalance
             if (oldMax !== null && newMax >= oldMax) {
                 return {
                     oldMax,
@@ -261,14 +235,6 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
                 };
             }
 
-            // 4) REBALANCE (solo se max diminuisce oppure oldMax null)
-            // Regola deterministica:
-            // - per ogni user_id, ordina apps per priority asc, created_at asc, id asc
-            // - tieni le prime newMax
-            // - set priority = 1..N (contigue)
-            // - delete delle eccedenti
-            //
-            // NB: facciamo tutto SQL-side per performance, ma logica è nel backend (non trigger).
             const rebalanceDelete = await client.query(
                 `
         with ranked as (
@@ -308,7 +274,6 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
           and a.priority is distinct from r.rn
         `
             );
-
 
             await client.query(`
         update users
@@ -355,14 +320,10 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
     }
 });
 
-
-
 /**
  * POST /api/admin/users/reset-active
- * Setta active=false per tutti gli utenti (admin-only)
  */
 adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
-
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
@@ -382,8 +343,8 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
                 usersUpdated: updUsers.rowCount,
             };
         });
-        invalidateMapCache();
 
+        invalidateMapCache();
 
         await audit("users_reset_active", r.user.id, {}, out, correlationId);
         return res.status(200).json({ ok: true, out, correlationId });
@@ -475,7 +436,6 @@ adminRouter.get("/users", async (req, res, next) => {
     }
 });
 
-
 adminRouter.post("/users", async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
@@ -500,13 +460,11 @@ adminRouter.post("/users", async (req, res, next) => {
     }
 });
 
-
 adminRouter.delete("/users/:id", async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const userId = req.params.id;
 
-        // opzionale: cleanup applications del user
         await pool.query(`delete from applications where user_id = $1`, [userId]);
 
         const del = await pool.query(`delete from users where id = $1`, [userId]);
@@ -517,7 +475,6 @@ adminRouter.delete("/users/:id", async (req, res, next) => {
         next(e);
     }
 });
-
 
 adminRouter.patch("/users/:id", async (req, res, next) => {
     try {
@@ -569,7 +526,6 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
     }
 });
 
-
 adminRouter.get("/positions", async (req, res, next) => {
     try {
         const { rows } = await pool.query(`
@@ -602,7 +558,6 @@ adminRouter.get("/locations", async (req, res, next) => {
     }
 });
 
-
 adminRouter.get("/roles", async (req, res, next) => {
     try {
         const { rows } = await pool.query(`
@@ -616,7 +571,6 @@ adminRouter.get("/roles", async (req, res, next) => {
         next(e);
     }
 });
-
 
 adminRouter.get("/test-scenarios", async (req, res, next) => {
     try {
@@ -632,10 +586,8 @@ adminRouter.get("/test-scenarios", async (req, res, next) => {
     }
 });
 
-
 /**
  * GET /api/admin/test-scenarios/:id/applications
- * Lista applications dello scenario
  */
 adminRouter.get("/test-scenarios/:id/applications", async (req, res, next) => {
     try {
@@ -664,13 +616,10 @@ adminRouter.get("/test-scenarios/:id/applications", async (req, res, next) => {
 
 /**
  * PATCH /api/admin/test-scenarios/:id
- * Rename scenario
- * body: { name }
  */
 adminRouter.patch("/test-scenarios/:id", async (req: Request, res: Response, next) => {
     try {
         const r = req as unknown as AuthedRequest;
-
         const correlationId = (req as any).correlationId;
         const scenarioId = req.params.id;
 
@@ -699,10 +648,8 @@ adminRouter.patch("/test-scenarios/:id", async (req: Request, res: Response, nex
     }
 });
 
-
 /**
  * DELETE /api/admin/test-scenarios/:id
- * Delete scenario + cascade applications
  */
 adminRouter.delete("/test-scenarios/:id", async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
@@ -745,7 +692,6 @@ adminRouter.delete("/test-scenarios/:id", async (req: Request, res: Response) =>
 
 /**
  * DELETE /api/admin/test-scenarios/:id/applications/:appId
- * Delete one application inside scenario
  */
 adminRouter.delete("/test-scenarios/:id/applications/:appId", async (req, res, next) => {
     try {
@@ -774,7 +720,6 @@ adminRouter.delete("/test-scenarios/:id/applications/:appId", async (req, res, n
 
 /**
  * DELETE /api/admin/test-scenarios/:id/applications
- * Delete all applications for scenario
  */
 adminRouter.delete("/test-scenarios/:id/applications", async (req: Request, res: Response, next) => {
     try {
@@ -796,7 +741,6 @@ adminRouter.delete("/test-scenarios/:id/applications", async (req: Request, res:
         next(e);
     }
 });
-
 
 adminRouter.get("/config", async (req, res, next) => {
     try {
@@ -835,7 +779,6 @@ adminRouter.post("/locations", async (req, res, next) => {
     }
 });
 
-
 adminRouter.delete("/locations/:id", async (req, res, next) => {
     try {
         const id = req.params.id;
@@ -846,7 +789,6 @@ adminRouter.delete("/locations/:id", async (req, res, next) => {
         next(e);
     }
 });
-
 
 adminRouter.post("/roles", async (req, res, next) => {
     try {
@@ -865,7 +807,6 @@ adminRouter.post("/roles", async (req, res, next) => {
     }
 });
 
-
 adminRouter.delete("/roles/:id", async (req, res, next) => {
     try {
         const id = req.params.id;
@@ -877,11 +818,8 @@ adminRouter.delete("/roles/:id", async (req, res, next) => {
     }
 });
 
-
 /**
  * POST /api/admin/test-scenarios
- * Crea scenario
- * body: { name }
  */
 adminRouter.post("/test-scenarios", async (req: Request, res: Response, next) => {
     try {
@@ -905,11 +843,8 @@ adminRouter.post("/test-scenarios", async (req: Request, res: Response, next) =>
     }
 });
 
-
 /**
  * POST /api/admin/test-scenarios/:id/applications
- * Inserisce candidatura nello scenario
- * body: { user_id, position_id, priority }
  */
 adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: Response, next) => {
     try {
@@ -944,4 +879,234 @@ adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: R
     }
 });
 
+/* =========================================================
+   INTERLOCKING SCENARIOS
+   ========================================================= */
 
+/**
+ * GET /api/admin/interlocking-scenarios
+ */
+adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+
+        const { rows } = await pool.query(
+            `
+            select
+              id,
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json,
+              created_at
+            from interlocking_scenarios
+            order by generated_at desc, created_at desc
+            limit 500
+            `
+        );
+
+        return res.json({
+            ok: true,
+            scenarios: rows,
+            correlationId,
+        });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * POST /api/admin/interlocking-scenarios
+ */
+adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+
+    try {
+        const {
+            scenario_code,
+            generated_at,
+            strategy,
+            max_len,
+            total_chains,
+            unique_people,
+            coverage,
+            avg_length,
+            max_length,
+            avg_priority,
+            build_nodes,
+            build_relationships,
+            chains_json,
+            optimal_chains_json,
+        } = req.body ?? {};
+
+        if (!scenario_code || !generated_at || !strategy || !Number.isFinite(Number(max_len))) {
+            return res.status(400).json({
+                ok: false,
+                error: "invalid body",
+                correlationId,
+            });
+        }
+
+        const { rows } = await pool.query(
+            `
+            insert into interlocking_scenarios (
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json
+            )
+            values (
+              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb
+            )
+            returning
+              id,
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json,
+              created_at
+            `,
+            [
+                String(scenario_code),
+                generated_at,
+                String(strategy),
+                Number(max_len),
+                Number(total_chains ?? 0),
+                Number(unique_people ?? 0),
+                coverage ?? null,
+                avg_length ?? null,
+                max_length ?? null,
+                avg_priority ?? null,
+                build_nodes ?? null,
+                build_relationships ?? null,
+                JSON.stringify(Array.isArray(chains_json) ? chains_json : []),
+                JSON.stringify(optimal_chains_json ?? null),
+            ]
+        );
+
+        const scenario = rows?.[0] ?? null;
+
+        await audit(
+            "interlocking_scenario_create",
+            r.user.id,
+            { scenario_code: String(scenario_code) },
+            { scenario },
+            correlationId
+        );
+
+        return res.status(201).json({
+            ok: true,
+            scenario,
+            correlationId,
+        });
+    } catch (e: any) {
+        await audit(
+            "interlocking_scenario_create",
+            r.user.id,
+            { body: req.body ?? {} },
+            { error: String(e?.message ?? e) },
+            correlationId
+        );
+
+        return res.status(500).json({
+            ok: false,
+            error: "Create interlocking scenario failed",
+            detail: String(e?.message ?? e),
+            correlationId,
+        });
+    }
+});
+
+/**
+ * DELETE /api/admin/interlocking-scenarios
+ * body: { ids: string[] }
+ */
+adminRouter.delete("/interlocking-scenarios", async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+
+    try {
+        const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
+
+        if (ids.length === 0) {
+            return res.status(400).json({
+                ok: false,
+                error: "ids required",
+                correlationId,
+            });
+        }
+
+        const del = await pool.query(
+            `
+            delete from interlocking_scenarios
+            where id = any($1::uuid[])
+            `,
+            [ids]
+        );
+
+        const out = {
+            requested: ids.length,
+            deleted: del.rowCount ?? 0,
+        };
+
+        await audit(
+            "interlocking_scenario_delete_many",
+            r.user.id,
+            { ids },
+            out,
+            correlationId
+        );
+
+        return res.json({
+            ok: true,
+            out,
+            correlationId,
+        });
+    } catch (e: any) {
+        await audit(
+            "interlocking_scenario_delete_many",
+            r.user.id,
+            { ids: req.body?.ids ?? null },
+            { error: String(e?.message ?? e) },
+            correlationId
+        );
+
+        return res.status(500).json({
+            ok: false,
+            error: "Delete interlocking scenarios failed",
+            detail: String(e?.message ?? e),
+            correlationId,
+        });
+    }
+});
