@@ -157,8 +157,27 @@ const adminLimiter = rateLimit({
     max: 60,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => (req as any).user?.id ?? req.ip,
+    keyGenerator: (req) => {
+        const key = (req as any).user?.id ?? req.ip;
+        console.log("ADMIN_LIMIT_KEY", {
+            path: req.originalUrl,
+            method: req.method,
+            userId: (req as any).user?.id ?? null,
+            ip: req.ip,
+            key,
+        });
+        return key;
+    },
     handler: (req, res, _next, options) => {
+        console.error("ADMIN_RATE_LIMIT_HIT", {
+            path: req.originalUrl,
+            method: req.method,
+            userId: (req as any).user?.id ?? null,
+            ip: req.ip,
+            key: (req as any).user?.id ?? req.ip,
+            statusCode: options.statusCode,
+        });
+
         return sendError(
             res,
             req,
@@ -179,6 +198,19 @@ adminApi.use("/", adminRouter);
 
 // 2) graph sync
 adminApi.use("/sync-graph", syncGraphRouter);
+adminApi.use(requireAuth);
+
+adminApi.use((req, _res, next) => {
+    console.log("ADMIN_REQ", {
+        method: req.method,
+        path: req.originalUrl,
+        userId: (req as any).user?.id ?? null,
+        ip: req.ip,
+    });
+    next();
+});
+
+adminApi.use(adminLimiter, requireAdmin);
 
 // 3) graph chains server-side
 adminApi.use("/graph", graphAdminRouter);
