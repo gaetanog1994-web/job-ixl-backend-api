@@ -7,6 +7,24 @@ import { audit } from "../audit.js";
 export const applicationsRouter = Router();
 
 /**
+ * Conta le candidature logiche dell'utente come gruppi (role_id, location_id) distinti.
+ * Una posizione con N occupanti genera N righe ma vale come 1 slot.
+ */
+async function countDistinctGroups(userId: string): Promise<number> {
+    const { data, error } = await supabaseAdmin
+        .from("applications")
+        .select("positions(role_id, location_id)")
+        .eq("user_id", userId);
+    if (error) throw error;
+    const groups = new Set<string>();
+    for (const row of data ?? []) {
+        const pos = (row as any).positions;
+        if (pos) groups.add(`${pos.role_id}__${pos.location_id}`);
+    }
+    return groups.size;
+}
+
+/**
  * POST /api/users/:userId/applications/bulk
  * Body: { positionIds: string[], priority: number }
  *
@@ -72,17 +90,34 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             });
         }
 
-        // Regola prodotto: una priority non può essere usata più di una volta dallo stesso utente
+        // Regola prodotto: una priority non può essere usata più di una volta dallo stesso utente,
+        // a meno che le righe esistenti appartengano allo stesso gruppo (role_id, location_id)
+        // delle positionIds in arrivo (stessa candidatura logica, nuovi occupanti).
+        const { data: incomingPositions, error: inPosErr } = await supabaseAdmin
+            .from("positions")
+            .select("id, role_id, location_id")
+            .in("id", positionIds);
+        if (inPosErr) throw inPosErr;
+
+        const incomingGroups = new Set(
+            (incomingPositions ?? []).map((p: any) => `${p.role_id}__${p.location_id}`)
+        );
+
         const { data: used, error: usedErr } = await supabaseAdmin
             .from("applications")
-            .select("id")
+            .select("positions(role_id, location_id)")
             .eq("user_id", targetUserId)
-            .eq("priority", priority)
-            .limit(1);
+            .eq("priority", priority);
 
         if (usedErr) throw usedErr;
 
-        if ((used ?? []).length > 0) {
+        const existingConflict = (used ?? []).some((row: any) => {
+            const pos = row.positions;
+            if (!pos) return true;
+            return !incomingGroups.has(`${pos.role_id}__${pos.location_id}`);
+        });
+
+        if (existingConflict) {
             return res.status(400).json({
                 error: "PRIORITY_ALREADY_USED",
                 message: `priority ${priority} is already used by this user`,
@@ -108,23 +143,17 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             return res.status(409).json({ error: "INSERT_FAILED", message: insErr.message });
         }
         invalidateMapCache(); // ✅ ESATTAMENTE QUI
-        const { count, error: cntErr } = await supabaseAdmin
-            .from("applications")
-            .select("*", { count: "exact", head: true })
-            .eq("user_id", targetUserId);
-
-        if (!cntErr) {
-            await supabaseAdmin
-                .from("users")
-                .update({ application_count: count ?? 0 })
-                .eq("id", targetUserId);
-        }
+        const distinctCount = await countDistinctGroups(targetUserId);
+        await supabaseAdmin
+            .from("users")
+            .update({ application_count: distinctCount })
+            .eq("id", targetUserId);
 
         await audit(
             "applications_bulk_apply",
             r.user.id,
             { targetUserId, priority, positionIdsCount: positionIds.length },
-            { inserted: rows.length, application_count: count ?? null },
+            { inserted: rows.length, application_count: distinctCount },
             correlationId
         );
         return res.status(200).json({ ok: true, inserted: rows.length });
@@ -176,28 +205,22 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
 
         invalidateMapCache();
 
-        // riallinea application_count (consistenza minima)
-        const { count, error: cntErr } = await supabaseAdmin
-            .from("applications")
-            .select("*", { count: "exact", head: true })
-            .eq("user_id", targetUserId);
-
-        if (!cntErr) {
-            await supabaseAdmin
-                .from("users")
-                .update({ application_count: count ?? 0 })
-                .eq("id", targetUserId);
-        }
+        // riallinea application_count contando gruppi (role_id, location_id) distinti
+        const distinctCount = await countDistinctGroups(targetUserId);
+        await supabaseAdmin
+            .from("users")
+            .update({ application_count: distinctCount })
+            .eq("id", targetUserId);
 
         await audit(
             "applications_bulk_withdraw",
             r.user.id,
             { targetUserId, positionIdsCount: positionIds.length },
-            { application_count: count ?? null },
+            { application_count: distinctCount },
             correlationId
         );
 
-        return res.status(200).json({ ok: true, deleted: true, application_count: count ?? null });
+        return res.status(200).json({ ok: true, deleted: true, application_count: distinctCount });
     } catch (err: any) {
         console.error("❌ applications bulk delete error", err);
 
