@@ -11,15 +11,24 @@ export const applicationsRouter = Router();
  * Una posizione con N occupanti genera N righe ma vale come 1 slot.
  */
 async function countDistinctGroups(userId: string): Promise<number> {
-    const { data, error } = await supabaseAdmin
+    const { data: appRows, error: appErr } = await supabaseAdmin
         .from("applications")
-        .select("positions(role_id, location_id)")
+        .select("position_id")
         .eq("user_id", userId);
-    if (error) throw error;
+    if (appErr) throw appErr;
+
+    const positionIds = (appRows ?? []).map((r: any) => r.position_id).filter(Boolean);
+    if (!positionIds.length) return 0;
+
+    const { data: positions, error: posErr } = await supabaseAdmin
+        .from("positions")
+        .select("id, role_id, location_id")
+        .in("id", positionIds);
+    if (posErr) throw posErr;
+
     const groups = new Set<string>();
-    for (const row of data ?? []) {
-        const pos = (row as any).positions;
-        if (pos) groups.add(`${pos.role_id}__${pos.location_id}`);
+    for (const pos of positions ?? []) {
+        groups.add(`${(pos as any).role_id}__${(pos as any).location_id}`);
     }
     return groups.size;
 }
@@ -105,17 +114,25 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
 
         const { data: used, error: usedErr } = await supabaseAdmin
             .from("applications")
-            .select("positions(role_id, location_id)")
+            .select("position_id")
             .eq("user_id", targetUserId)
             .eq("priority", priority);
-
         if (usedErr) throw usedErr;
 
-        const existingConflict = (used ?? []).some((row: any) => {
-            const pos = row.positions;
-            if (!pos) return true;
-            return !incomingGroups.has(`${pos.role_id}__${pos.location_id}`);
-        });
+        const usedPositionIds = (used ?? []).map((r: any) => r.position_id).filter(Boolean);
+
+        let existingConflict = false;
+        if (usedPositionIds.length > 0) {
+            const { data: usedPositions, error: upErr } = await supabaseAdmin
+                .from("positions")
+                .select("id, role_id, location_id")
+                .in("id", usedPositionIds);
+            if (upErr) throw upErr;
+
+            existingConflict = (usedPositions ?? []).some((pos: any) => {
+                return !incomingGroups.has(`${pos.role_id}__${pos.location_id}`);
+            });
+        }
 
         if (existingConflict) {
             return res.status(400).json({
