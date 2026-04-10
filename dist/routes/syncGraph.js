@@ -22,7 +22,7 @@ export const syncGraphRouter = Router();
  * - backend-api costruisce dataset da Supabase (source of truth)
  * - graph-engine esegue build-graph (token-only)
  */
-syncGraphRouter.post("/sync-graph", async (req, res) => {
+syncGraphRouter.post("/", async (req, res) => {
     const correlationId = req.correlationId;
     try {
         // 1) Leggi applications (source of truth)
@@ -66,8 +66,8 @@ syncGraphRouter.post("/sync-graph", async (req, res) => {
         // 4) Chiama graph-engine: warmup (best-effort) + build-graph
         // warmup (non blocca)
         try {
-            await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
-                method: "POST",
+            await fetch(new URL("/health", GRAPH_SERVICE_URL).toString(), {
+                method: "GET",
                 headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
             });
         }
