@@ -62,17 +62,21 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
             throw e;
         }
 
-        // Scegli SOLO i campi che vuoi esporre al FE
         const { rows } = await pool.query(
             `select
-         id,
-         email,
-         availability_status,
-         location_id,
-         role_id,
-         fixed_location
-       from users
-       where id = $1
+         u.id,
+         u.email,
+         u.full_name,
+         u.availability_status,
+         u.location_id,
+         u.role_id,
+         u.fixed_location,
+         l.name as location_name,
+         r.name as role_name
+       from users u
+       left join locations l on l.id = u.location_id
+       left join roles r on r.id = u.role_id
+       where u.id = $1
        limit 1`,
             [userId]
         );
