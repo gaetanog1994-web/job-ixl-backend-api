@@ -1,5 +1,5 @@
 import { Router, Request, Response } from "express";
-import { withTx, pool } from "../db.js";
+import { withTx, pool, supabaseAdmin } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js";
@@ -121,6 +121,61 @@ adminRouter.post(
         }
     }
 );
+
+/**
+ * POST /api/admin/users/invite
+ */
+adminRouter.post("/users/invite", async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+
+    try {
+        const { email, full_name, location_id } = req.body ?? {};
+
+        if (!email || !full_name) {
+            return res.status(400).json({ ok: false, error: "missing email or full_name", correlationId });
+        }
+
+        const { data, error: inviteError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
+            String(email).trim(),
+            { data: { full_name: String(full_name).trim(), location_id: location_id ?? null } }
+        );
+
+        if (inviteError) {
+            return res.status(500).json({ ok: false, error: inviteError.message, correlationId });
+        }
+
+        const userId = data.user?.id;
+        if (!userId) {
+            return res.status(500).json({ ok: false, error: "invite returned no user id", correlationId });
+        }
+
+        await pool.query(
+            `
+            insert into users (id, email, full_name, location_id, availability_status, application_count)
+            values ($1, $2, $3, $4, 'inactive', 0)
+            on conflict (id) do update
+              set email = excluded.email,
+                  full_name = excluded.full_name,
+                  location_id = excluded.location_id
+            `,
+            [userId, String(email).trim(), String(full_name).trim(), location_id ?? null]
+        );
+
+        await audit("admin_invite_user", r.user.id, { email, full_name }, { userId }, correlationId);
+
+        return res.status(200).json({ ok: true, user: { id: userId, email }, correlationId });
+    } catch (e: any) {
+        await audit(
+            "admin_invite_user",
+            (req as any)?.user?.id ?? "unknown",
+            { email: req.body?.email ?? null },
+            { error: String(e?.message ?? e) },
+            correlationId
+        );
+        return res.status(500).json({ ok: false, error: "Invite failed", detail: String(e?.message ?? e), correlationId });
+    }
+});
 
 /**
  * GET /api/admin/users/active
