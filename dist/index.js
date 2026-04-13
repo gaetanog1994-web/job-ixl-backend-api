@@ -2,7 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
-import { requireAuth, requireAdmin, attachIsAdmin } from "./auth.js";
+import { requireAuth, requireAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
 import { adminRouter } from "./routes/admin.js";
 import { graphProxyRouter } from "./routes/graphProxy.js";
@@ -13,6 +13,8 @@ import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
 import { publicRouter } from "./routes/public.js";
 import { graphAdminRouter } from "./routes/graphAdmin.js";
+import { platformRouter } from "./routes/platform.js";
+import { attachAccessContext, requirePerimeterAccess, requirePerimeterAdmin, requireTenantScope, } from "./tenant.js";
 const app = express();
 function getCorrelationId(req) {
     return req?.correlationId ?? null;
@@ -62,25 +64,32 @@ app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(correlation);
 // ✅ DOPO CORS
-app.use("/api/users", requireAuth, usersRouter);
-app.use("/api/map", requireAuth, mapRouter);
-app.use("/api", requireAuth, applicationsRouter);
+app.use("/api/platform", requireAuth, attachAccessContext, platformRouter);
+app.use("/api/users", requireAuth, attachAccessContext, requireTenantScope, usersRouter);
+app.use("/api/map", requireAuth, attachAccessContext, requirePerimeterAccess, mapRouter);
+app.use("/api", requireAuth, attachAccessContext, requireTenantScope, applicationsRouter);
 app.use("/api/public", publicRouter);
-app.get("/api/me", requireAuth, attachIsAdmin, (req, res) => {
+app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
     const r = req;
     res.json({
         user: r.user,
-        isAdmin: r.isAdmin === true,
+        isAdmin: r.accessContext?.canManagePerimeter === true,
+        isOwner: r.accessContext?.isOwner === true,
+        isSuperAdmin: r.accessContext?.isCompanySuperAdmin === true,
+        access: r.accessContext ?? null,
     });
 });
-app.get("/api/config", requireAuth, async (req, res, next) => {
+app.get("/api/config", requireAuth, attachAccessContext, requirePerimeterAccess, async (req, res, next) => {
     try {
+        const access = req.accessContext;
         const { rows } = await pool.query(`
             select max_applications
             from app_config
             where singleton = true
+              and company_id = $1
+              and perimeter_id = $2
             limit 1
-        `);
+        `, [access.currentCompanyId, access.currentPerimeterId]);
         return res.json({
             ok: true,
             config: rows?.[0] ?? null,
@@ -147,11 +156,11 @@ const adminLimiter = rateLimit({
 // Stack admin unico
 const adminApi = express.Router();
 adminApi.use(requireAuth, adminLimiter, requireAdmin);
+adminApi.use(attachAccessContext, requirePerimeterAdmin);
 // 1) rotte admin “normali”
 adminApi.use("/", adminRouter);
 // 2) graph sync
 adminApi.use("/sync-graph", syncGraphRouter);
-adminApi.use(requireAuth);
 adminApi.use((req, _res, next) => {
     console.log("ADMIN_REQ", {
         method: req.method,
@@ -161,7 +170,6 @@ adminApi.use((req, _res, next) => {
     });
     next();
 });
-adminApi.use(adminLimiter, requireAdmin);
 // 3) graph chains server-side
 adminApi.use("/graph", graphAdminRouter);
 // 4) graph proxy

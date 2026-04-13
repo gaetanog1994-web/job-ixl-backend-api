@@ -11,6 +11,10 @@ export const graphAdminRouter = Router();
 graphAdminRouter.post("/chains", async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId ?? null;
+        const access = (req as any).accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
 
         // 1) Build edges user_id -> target_user_id dal DB (applications + positions.occupied_by)
         const { rows } = await pool.query(
@@ -24,7 +28,13 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
   join positions p on p.id = a.position_id
   where p.occupied_by is not null
     and a.user_id is not null
+    and a.company_id = $1
+    and a.perimeter_id = $2
+    and p.company_id = $1
+    and p.perimeter_id = $2
   `
+            ,
+            [access.currentCompanyId, access.currentPerimeterId]
         );
 
         const edgePriority = new Map<string, number>();
@@ -136,8 +146,10 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
   select id, full_name
   from users
   where id = any($1)
+    and company_id = $2
+    and perimeter_id = $3
   `,
-            [allUserIds]
+            [allUserIds, access.currentCompanyId, access.currentPerimeterId]
         );
 
         const usersById: Record<string, string> = Object.fromEntries(
@@ -160,6 +172,8 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
             ok: true,
             summary,
             chains: enrichedChains,
+            companyId: access.currentCompanyId,
+            perimeterId: access.currentPerimeterId,
             correlationId,
         });
 

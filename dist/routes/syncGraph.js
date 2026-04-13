@@ -25,10 +25,16 @@ export const syncGraphRouter = Router();
 syncGraphRouter.post("/", async (req, res) => {
     const correlationId = req.correlationId;
     try {
+        const access = req.accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({ error: "Perimeter context required", correlationId });
+        }
         // 1) Leggi applications (source of truth)
         const { data: apps, error: appsErr } = await supabaseAdmin
             .from("applications")
-            .select("user_id, position_id, priority");
+            .select("user_id, position_id, priority")
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (appsErr) {
             return res.status(500).json({ error: appsErr.message, correlationId });
         }
@@ -37,7 +43,9 @@ syncGraphRouter.post("/", async (req, res) => {
         const { data: positions, error: posErr } = await supabaseAdmin
             .from("positions")
             .select("id, occupied_by")
-            .in("id", positionIds);
+            .in("id", positionIds)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (posErr) {
             return res.status(500).json({ error: posErr.message, correlationId });
         }
@@ -47,6 +55,8 @@ syncGraphRouter.post("/", async (req, res) => {
             user_id: a.user_id,
             target_user_id: posToOccupant.get(a.position_id) ?? null,
             priority: a.priority ?? null,
+            company_id: access.currentCompanyId,
+            perimeter_id: access.currentPerimeterId,
         }))
             .filter((e) => e.user_id && e.target_user_id);
         // 3) usersById (nome visualizzato in grafo)
@@ -54,7 +64,9 @@ syncGraphRouter.post("/", async (req, res) => {
         const { data: users, error: usersErr } = await supabaseAdmin
             .from("users")
             .select("id, full_name")
-            .in("id", userIds);
+            .in("id", userIds)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (usersErr) {
             return res.status(500).json({ error: usersErr.message, correlationId });
         }
@@ -66,9 +78,16 @@ syncGraphRouter.post("/", async (req, res) => {
         // 4) Chiama graph-engine: warmup (best-effort) + build-graph
         // warmup (non blocca)
         try {
-            await fetch(new URL("/health", GRAPH_SERVICE_URL).toString(), {
-                method: "GET",
-                headers: { "x-graph-token": GRAPH_SERVICE_TOKEN },
+            await fetch(new URL("/neo4j/warmup", GRAPH_SERVICE_URL).toString(), {
+                method: "POST",
+                headers: {
+                    "x-graph-token": GRAPH_SERVICE_TOKEN,
+                    "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                    companyId: access.currentCompanyId,
+                    perimeterId: access.currentPerimeterId,
+                }),
             });
         }
         catch {
@@ -80,7 +99,12 @@ syncGraphRouter.post("/", async (req, res) => {
                 "Content-Type": "application/json",
                 "x-graph-token": GRAPH_SERVICE_TOKEN,
             },
-            body: JSON.stringify({ applications: edges, usersById }),
+            body: JSON.stringify({
+                applications: edges,
+                usersById,
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            }),
         });
         const buildJson = await buildRes.json().catch(() => null);
         if (!buildRes.ok) {
@@ -96,6 +120,7 @@ syncGraphRouter.post("/", async (req, res) => {
             correlationId,
             dataset: {
                 applicationsRead: apps?.length ?? 0,
+                applicationsScoped: apps?.length ?? 0,
                 edgesBuilt: edges.length,
                 usersMapped: Object.keys(usersById).length,
             },

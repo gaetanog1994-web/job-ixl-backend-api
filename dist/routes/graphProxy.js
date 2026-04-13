@@ -9,12 +9,24 @@ if (!GRAPH_SERVICE_TOKEN)
 // Catch-all: qualunque path sotto /api/admin/graph/*
 graphProxyRouter.use(async (req, res) => {
     try {
+        const access = req.accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId: req.correlationId ?? null,
+            });
+        }
         const base = GRAPH_SERVICE_URL.replace(/\/+$/, "");
         let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
-        // RC1: warmup non esiste sul graph-engine → alias a /health
         if (forwardPath === "/warmup")
-            forwardPath = "/health";
-        const headers = { "x-graph-token": GRAPH_SERVICE_TOKEN };
+            forwardPath = "/neo4j/warmup";
+        const targetUrl = new URL(`${base}${forwardPath}`);
+        const headers = {
+            "x-graph-token": GRAPH_SERVICE_TOKEN,
+            "x-company-id": access.currentCompanyId,
+            "x-perimeter-id": access.currentPerimeterId,
+        };
         const ct = req.headers["content-type"];
         if (typeof ct === "string")
             headers["content-type"] = ct;
@@ -22,18 +34,29 @@ graphProxyRouter.use(async (req, res) => {
         if (typeof accept === "string")
             headers["accept"] = accept;
         const method = req.method.toUpperCase();
-        const body = method === "GET" || method === "HEAD"
-            ? undefined
-            : (req.body ? JSON.stringify(req.body) : "{}");
-        async function doFetch(path) {
-            const url = `${base}${path}`;
-            return fetch(url, { method, headers, body });
+        let body;
+        if (method !== "GET" && method !== "HEAD") {
+            const sourceBody = req.body && typeof req.body === "object" ? req.body : {};
+            body = JSON.stringify({
+                ...sourceBody,
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            });
+        }
+        else {
+            targetUrl.searchParams.set("companyId", access.currentCompanyId);
+            targetUrl.searchParams.set("perimeterId", access.currentPerimeterId);
+        }
+        async function doFetch(url) {
+            return fetch(url.toString(), { method, headers, body });
         }
         // 1) prima prova
-        let resp = await doFetch(forwardPath);
+        let resp = await doFetch(targetUrl);
         // 2) fallback /api se 404 (utile per future routes)
         if (resp.status === 404 && !forwardPath.startsWith("/api/")) {
-            resp = await doFetch(`/api${forwardPath}`);
+            const fallback = new URL(`${base}/api${forwardPath}`);
+            fallback.search = targetUrl.search;
+            resp = await doFetch(fallback);
         }
         const text = await resp.text();
         res.status(resp.status);

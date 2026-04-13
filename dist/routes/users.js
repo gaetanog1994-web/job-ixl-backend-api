@@ -13,8 +13,11 @@ usersRouter.post("/me/ensure", async (req, res, next) => {
     try {
         const r = req;
         const correlationId = req.correlationId ?? null;
-        const { full_name, location_id } = req.body ?? {};
-        const fullName = String(full_name ?? "").trim();
+        const access = r.accessContext;
+        const { full_name, first_name, last_name, location_id } = req.body ?? {};
+        const firstName = String(first_name ?? "").trim();
+        const lastName = String(last_name ?? "").trim();
+        const fullName = String(full_name ?? `${firstName} ${lastName}`).trim();
         const locationId = location_id ? String(location_id) : null;
         if (!fullName) {
             const e = new Error("missing full_name");
@@ -22,13 +25,31 @@ usersRouter.post("/me/ensure", async (req, res, next) => {
             throw e;
         }
         const { rows } = await pool.query(`
-      insert into users (id, email, full_name, location_id, availability_status, application_count)
-      values ($1, $2, $3, $4, 'inactive', 0)
+      insert into users (
+        id, email, first_name, last_name, full_name, location_id, availability_status,
+        application_count, company_id, perimeter_id, home_perimeter_id, updated_by
+      )
+      values ($1, $2, $3, $4, $5, $6, 'inactive', 0, $7, $8, $8, $1)
       on conflict (id) do update
-        set full_name = excluded.full_name,
-            location_id = excluded.location_id
-      returning id, email, full_name, location_id, availability_status, application_count, role_id, fixed_location
-      `, [r.user.id, r.user.email ?? null, fullName, locationId]);
+        set first_name = excluded.first_name,
+            last_name = excluded.last_name,
+            full_name = excluded.full_name,
+            location_id = excluded.location_id,
+            company_id = coalesce(excluded.company_id, users.company_id),
+            perimeter_id = coalesce(excluded.perimeter_id, users.perimeter_id),
+            home_perimeter_id = coalesce(excluded.home_perimeter_id, users.home_perimeter_id),
+            updated_by = excluded.updated_by
+      returning id, email, first_name, last_name, full_name, location_id, availability_status, application_count, role_id, fixed_location, company_id, perimeter_id, home_perimeter_id
+      `, [
+            r.user.id,
+            r.user.email ?? null,
+            firstName || null,
+            lastName || null,
+            fullName,
+            locationId,
+            access?.currentCompanyId ?? null,
+            access?.currentPerimeterId ?? null,
+        ]);
         invalidateMapCache();
         await audit("user_ensure_profile", r.user.id, { locationId }, { userId: r.user.id }, correlationId);
         return res.json({ ok: true, user: rows[0], correlationId });
@@ -40,28 +61,52 @@ usersRouter.post("/me/ensure", async (req, res, next) => {
 usersRouter.get("/me", async (req, res, next) => {
     try {
         const userId = req.user?.id;
+        const access = req.accessContext;
         if (!userId) {
             const e = new Error("Missing authed user");
             e.status = 401;
             throw e;
         }
-        // Scegli SOLO i campi che vuoi esporre al FE
         const { rows } = await pool.query(`select
-         id,
-         email,
-         availability_status,
-         location_id,
-         role_id,
-         fixed_location
-       from users
-       where id = $1
-       limit 1`, [userId]);
+         u.id,
+         u.email,
+         u.first_name,
+         u.last_name,
+         u.full_name,
+         u.availability_status,
+         u.location_id,
+         u.role_id,
+         u.fixed_location,
+         u.company_id,
+         u.home_perimeter_id,
+         l.name as location_name,
+         r.name as role_name,
+         c.name as company_name,
+         p.name as perimeter_name
+       from users u
+       left join locations l on l.id = u.location_id
+       left join roles r on r.id = u.role_id
+       left join companies c on c.id = $2
+       left join perimeters p on p.id = $3
+       where u.id = $1
+        and u.company_id = $2
+        and coalesce(u.perimeter_id, u.home_perimeter_id) = $3
+       limit 1`, [userId, access?.currentCompanyId ?? null, access?.currentPerimeterId ?? null]);
         if (!rows[0]) {
             const e = new Error("User row not found");
             e.status = 404;
             throw e;
         }
-        return res.json({ ok: true, user: rows[0], correlationId: req.correlationId ?? null });
+        return res.json({
+            ok: true,
+            user: {
+                ...rows[0],
+                access_role: access?.accessRole ?? null,
+                is_owner: access?.isOwner ?? false,
+                is_super_admin: access?.isCompanySuperAdmin ?? false,
+            },
+            correlationId: req.correlationId ?? null,
+        });
     }
     catch (err) {
         next(err);
@@ -71,9 +116,15 @@ usersRouter.get("/me", async (req, res, next) => {
 usersRouter.get("/me/applications", async (req, res, next) => {
     try {
         const userId = req.user?.id;
+        const access = req.accessContext;
         if (!userId) {
             const e = new Error("Missing authed user");
             e.status = 401;
+            throw e;
+        }
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            const e = new Error("Perimeter context required");
+            e.status = 400;
             throw e;
         }
         const { rows } = await pool.query(`
@@ -99,8 +150,10 @@ usersRouter.get("/me/applications", async (req, res, next) => {
       left join roles r on r.id = ou.role_id
       left join locations l on l.id = ou.location_id
       where a.user_id = $1
+        and a.company_id = $2
+        and a.perimeter_id = $3
       order by a.priority asc, a.created_at asc
-      `, [userId]);
+      `, [userId, access.currentCompanyId, access.currentPerimeterId]);
         // ricostruiamo una shape compatibile con la vecchia select supabase (minimo necessario)
         const apps = rows.map((r) => ({
             id: r.app_id,
@@ -136,14 +189,18 @@ usersRouter.post("/me/deactivate", async (req, res) => {
     const correlationId = req.correlationId;
     try {
         const out = await withTx(async (client) => {
-            await client.query(`delete from applications where user_id = $1`, [r.user.id]);
+            const access = r.accessContext;
+            await client.query(`delete from applications where user_id = $1 and company_id = $2 and perimeter_id = $3`, [r.user.id, access?.currentCompanyId ?? null, access?.currentPerimeterId ?? null]);
             const upd = await client.query(`update users
                     set availability_status = 'inactive',
                         show_position = false,
-                        application_count = 0
+                        application_count = 0,
+                        updated_by = $1
                     where id = $1
+                      and company_id = $2
+                      and coalesce(perimeter_id, home_perimeter_id) = $3
                     returning id, availability_status, show_position
-                `, [r.user.id]);
+                `, [r.user.id, r.accessContext?.currentCompanyId ?? null, r.accessContext?.currentPerimeterId ?? null]);
             return {
                 userId: r.user.id,
                 status: upd.rows?.[0]?.availability_status ?? "inactive",
@@ -171,10 +228,13 @@ usersRouter.post("/me/activate", async (req, res) => {
             const upd = await client.query(`
                 update users
                     set availability_status = 'available',
-                        show_position = true
+                        show_position = true,
+                        updated_by = $1
                     where id = $1
+                      and company_id = $2
+                      and coalesce(perimeter_id, home_perimeter_id) = $3
                     returning id, availability_status, show_position
-                `, [r.user.id]);
+                `, [r.user.id, r.accessContext?.currentCompanyId ?? null, r.accessContext?.currentPerimeterId ?? null]);
             return {
                 userId: r.user.id,
                 status: upd.rows?.[0]?.availability_status ?? "available",

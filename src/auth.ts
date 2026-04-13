@@ -1,5 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { createClient } from "@supabase/supabase-js";
+import type { AccessContext } from "./tenant.js";
+import { loadAccessContext, readRequestedContext } from "./tenant.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -14,6 +16,7 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 export type AuthedRequest = Request & {
     user: { id: string; email?: string };
     isAdmin?: boolean;
+    accessContext?: AccessContext;
 };
 
 
@@ -43,15 +46,11 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
 export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
     try {
         const r = req as AuthedRequest;
-
-        const { data, error } = await supabaseAdmin
-            .from("app_admins")
-            .select("user_id")
-            .eq("user_id", r.user.id)
-            .maybeSingle();
-
-        if (error) return next(httpError(500, "RBAC check failed"));
-        if (!data) return next(httpError(403, "Admin only"));
+        if (!r.accessContext) {
+            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
+            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
+        }
+        if (!r.accessContext.canManagePerimeter) return next(httpError(403, "Admin only"));
         r.isAdmin = true;
 
         return next();
@@ -63,23 +62,14 @@ export async function requireAdmin(req: Request, _res: Response, next: NextFunct
 export async function attachIsAdmin(req: Request, _res: Response, next: NextFunction) {
     try {
         const r = req as AuthedRequest;
-
-        const { data, error } = await supabaseAdmin
-            .from("app_admins")
-            .select("user_id")
-            .eq("user_id", r.user.id)
-            .maybeSingle();
-
-        if (error) {
-            (req as any).isAdmin = false;
-            return next();
+        if (!r.accessContext) {
+            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
+            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
         }
-
-        (req as any).isAdmin = !!data;
+        (req as any).isAdmin = r.accessContext.canManagePerimeter === true;
         return next();
     } catch {
         (req as any).isAdmin = false;
         return next();
     }
 }
-

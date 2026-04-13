@@ -14,6 +14,15 @@ const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;
 if (!GRAPH_SERVICE_URL) throw new Error("Missing GRAPH_SERVICE_URL");
 if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
 
+function getTenantScope(req: Request) {
+    const access = (req as AuthedRequest).accessContext;
+    return {
+        access,
+        companyId: access?.currentCompanyId ?? null,
+        perimeterId: access?.currentPerimeterId ?? null,
+    };
+}
+
 /**
  * POST /api/admin/test-scenarios/:id/initialize
  */
@@ -23,6 +32,7 @@ adminRouter.post(
         const r = req as unknown as AuthedRequest;
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         try {
             const result = await withTx(async (client) => {
@@ -31,25 +41,31 @@ adminRouter.post(
             select user_id, position_id, priority
             from test_scenario_applications
             where scenario_id = $1
+              and company_id = $2
+              and perimeter_id = $3
         `,
-                    [scenarioId]
+                    [scenarioId, companyId, perimeterId]
                 );
 
                 await client.query(`
                     update users
                     set availability_status = 'inactive',
                         application_count = 0
-                `);
-                await client.query(`delete from applications`);
+                    where company_id = $1
+                      and coalesce(perimeter_id, home_perimeter_id) = $2
+                `, [companyId, perimeterId]);
+                await client.query(`delete from applications where company_id = $1 and perimeter_id = $2`, [companyId, perimeterId]);
 
                 await client.query(
                     `
-            insert into applications (user_id, position_id, priority)
-            select user_id, position_id, priority
+            insert into applications (user_id, position_id, priority, company_id, perimeter_id)
+            select user_id, position_id, priority, company_id, perimeter_id
             from test_scenario_applications
             where scenario_id = $1
+              and company_id = $2
+              and perimeter_id = $3
         `,
-                    [scenarioId]
+                    [scenarioId, companyId, perimeterId]
                 );
 
                 await client.query(
@@ -60,6 +76,8 @@ adminRouter.post(
                 select distinct user_id
                 from test_scenario_applications
                 where scenario_id = $1
+                  and company_id = $2
+                  and perimeter_id = $3
 
                 union
 
@@ -67,10 +85,12 @@ adminRouter.post(
                 from test_scenario_applications tsa
                 join positions p on p.id = tsa.position_id
                 where tsa.scenario_id = $1
+                  and tsa.company_id = $2
+                  and tsa.perimeter_id = $3
                   and p.occupied_by is not null
                   )
                   `,
-                    [scenarioId]
+                    [scenarioId, companyId, perimeterId]
                 );
 
                 await client.query(`
@@ -79,18 +99,25 @@ adminRouter.post(
                     from (
                         select u2.id as user_id, count(a.*)::int as cnt
                         from users u2
-                        left join applications a on a.user_id = u2.id
+                        left join applications a on a.user_id = u2.id and a.company_id = $1 and a.perimeter_id = $2
+                        where u2.company_id = $1
+                          and coalesce(u2.perimeter_id, u2.home_perimeter_id) = $2
                         group by u2.id
                     ) x
                     where u.id = x.user_id
-                    `
+                    `,
+                    [companyId, perimeterId]
                 );
 
                 await client.query(`
                     update users
                     set application_count = 0
-                    where id not in (select distinct user_id from applications)
-                `);
+                    where company_id = $1
+                      and coalesce(perimeter_id, home_perimeter_id) = $2
+                      and id not in (
+                        select distinct user_id from applications where company_id = $1 and perimeter_id = $2
+                      )
+                `, [companyId, perimeterId]);
 
                 return {
                     insertedApplications: rows.rowCount,
@@ -130,15 +157,29 @@ adminRouter.post("/users/invite", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
 
     try {
-        const { email, full_name, location_id } = req.body ?? {};
+        const { companyId, perimeterId } = getTenantScope(req);
+        const { email, full_name, first_name, last_name, location_id, access_role } = req.body ?? {};
+        const firstName = String(first_name ?? "").trim();
+        const lastName = String(last_name ?? "").trim();
+        const normalizedFullName = String(full_name ?? `${firstName} ${lastName}`).trim().replace(/\s+/g, " ");
+        const normalizedEmail = String(email ?? "").trim().toLowerCase();
+        const normalizedAccessRole =
+            access_role === "admin" || access_role === "admin_user" ? access_role : "user";
 
-        if (!email || !full_name) {
-            return res.status(400).json({ ok: false, error: "missing email or full_name", correlationId });
+        if (!normalizedEmail || !normalizedFullName) {
+            return res.status(400).json({ ok: false, error: "missing email or user name", correlationId });
         }
 
         const { data, error: inviteError } = await supabaseAdmin.auth.admin.inviteUserByEmail(
-            String(email).trim(),
-            { data: { full_name: String(full_name).trim(), location_id: location_id ?? null } }
+            normalizedEmail,
+            {
+                data: {
+                    first_name: firstName || null,
+                    last_name: lastName || null,
+                    full_name: normalizedFullName,
+                    location_id: location_id ?? null,
+                },
+            }
         );
 
         if (inviteError) {
@@ -152,19 +193,50 @@ adminRouter.post("/users/invite", async (req: Request, res: Response) => {
 
         await pool.query(
             `
-            insert into users (id, email, full_name, location_id, availability_status, application_count)
-            values ($1, $2, $3, $4, 'inactive', 0)
+            insert into users (
+              id, email, first_name, last_name, full_name, location_id, availability_status, application_count,
+              company_id, perimeter_id, home_perimeter_id, created_by, updated_by
+            )
+            values ($1, $2, $3, $4, $5, $6, 'inactive', 0, $7, $8, $8, $9, $9)
             on conflict (id) do update
               set email = excluded.email,
+                  first_name = excluded.first_name,
+                  last_name = excluded.last_name,
                   full_name = excluded.full_name,
-                  location_id = excluded.location_id
+                  location_id = excluded.location_id,
+                  company_id = excluded.company_id,
+                  perimeter_id = excluded.perimeter_id,
+                  home_perimeter_id = excluded.home_perimeter_id,
+                  updated_by = excluded.updated_by
             `,
-            [userId, String(email).trim(), String(full_name).trim(), location_id ?? null]
+            [userId, normalizedEmail, firstName || null, lastName || null, normalizedFullName, location_id ?? null, companyId, perimeterId, r.user.id]
         );
 
-        await audit("admin_invite_user", r.user.id, { email, full_name }, { userId }, correlationId);
+        await pool.query(
+            `
+            insert into perimeter_memberships (company_id, perimeter_id, user_id, access_role, status, created_by)
+            values ($1, $2, $3, $4, 'active', $5)
+            on conflict (perimeter_id, user_id) do update
+              set access_role = excluded.access_role,
+                  status = excluded.status
+            `,
+            [companyId, perimeterId, userId, normalizedAccessRole, r.user.id]
+        );
 
-        return res.status(200).json({ ok: true, user: { id: userId, email }, correlationId });
+        await audit("admin_invite_user", r.user.id, { email: normalizedEmail, full_name: normalizedFullName }, { userId }, correlationId);
+
+        return res.status(200).json({
+            ok: true,
+            user: {
+                id: userId,
+                email: normalizedEmail,
+                first_name: firstName || null,
+                last_name: lastName || null,
+                full_name: normalizedFullName,
+                access_role: normalizedAccessRole,
+            },
+            correlationId,
+        });
     } catch (e: any) {
         await audit(
             "admin_invite_user",
@@ -182,6 +254,7 @@ adminRouter.post("/users/invite", async (req: Request, res: Response) => {
  */
 adminRouter.get("/users/active", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
             `
       select
@@ -194,8 +267,12 @@ adminRouter.get("/users/active", async (req, res, next) => {
         role_id
       from users
       where availability_status = 'available'
+        and company_id = $1
+        and coalesce(perimeter_id, home_perimeter_id) = $2
       order by full_name nulls last, id
       `
+            ,
+            [companyId, perimeterId]
         );
 
         return res.json({
@@ -217,15 +294,22 @@ adminRouter.post(
         const r = req as unknown as AuthedRequest;
         const userId = req.params.id;
         const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         try {
             const out = await withTx(async (client) => {
-                await client.query(`update users set availability_status = 'inactive' where id = $1`, [
-                    userId,
-                ]);
-                await client.query(`delete from applications where user_id = $1`, [
-                    userId,
-                ]);
+                await client.query(
+                    `update users
+                     set availability_status = 'inactive', updated_by = $1
+                     where id = $2
+                       and company_id = $3
+                       and coalesce(perimeter_id, home_perimeter_id) = $4`,
+                    [r.user.id, userId, companyId, perimeterId]
+                );
+                await client.query(
+                    `delete from applications where user_id = $1 and company_id = $2 and perimeter_id = $3`,
+                    [userId, companyId, perimeterId]
+                );
                 return { deactivatedUserId: userId };
             });
 
@@ -261,6 +345,7 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
     const correlationId = (req as any).correlationId;
 
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { maxApplications } = req.body ?? {};
         const newMax = Number(maxApplications);
 
@@ -273,13 +358,14 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
 
         const out = await withTx(async (client) => {
             const oldRow = await client.query(
-                `select max_applications from app_config where singleton = true limit 1`
+                `select max_applications from app_config where singleton = true and company_id = $1 and perimeter_id = $2 limit 1`,
+                [companyId, perimeterId]
             );
             const oldMax: number | null = oldRow.rows?.[0]?.max_applications ?? null;
 
             await client.query(
-                `update app_config set max_applications = $1 where singleton = true`,
-                [newMax]
+                `update app_config set max_applications = $1 where singleton = true and company_id = $2 and perimeter_id = $3`,
+                [newMax, companyId, perimeterId]
             );
 
             if (oldMax !== null && newMax >= oldMax) {
@@ -301,13 +387,14 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
               order by priority asc nulls last, created_at asc, id asc
             ) as rn
           from applications
+          where company_id = $2 and perimeter_id = $3
         )
         delete from applications a
         using ranked r
         where a.id = r.id
           and r.rn > $1
         `,
-                [newMax]
+                [newMax, companyId, perimeterId]
             );
 
             const rebalanceUpdate = await client.query(
@@ -321,20 +408,26 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
               order by priority asc nulls last, created_at asc, id asc
             ) as rn
           from applications
+          where company_id = $1 and perimeter_id = $2
         )
         update applications a
         set priority = r.rn
         from ranked r
         where a.id = r.id
           and a.priority is distinct from r.rn
-        `
+        `,
+                [companyId, perimeterId]
             );
 
             await client.query(`
         update users
         set application_count = 0
-        where id not in (select distinct user_id from applications)
-      `);
+        where company_id = $1
+          and coalesce(perimeter_id, home_perimeter_id) = $2
+          and id not in (
+            select distinct user_id from applications where company_id = $1 and perimeter_id = $2
+          )
+      `, [companyId, perimeterId]);
 
             return {
                 oldMax,
@@ -383,15 +476,18 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
     const correlationId = (req as any).correlationId;
 
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const out = await withTx(async (client) => {
-            const delApps = await client.query(`delete from applications`);
+            const delApps = await client.query(`delete from applications where company_id = $1 and perimeter_id = $2`, [companyId, perimeterId]);
             const updUsers = await client.query(`
                 update users
                 set availability_status = 'inactive',
                     application_count = 0
-                where availability_status is distinct from 'inactive'
-                   or application_count is distinct from 0
-            `);
+                where (availability_status is distinct from 'inactive'
+                   or application_count is distinct from 0)
+                  and company_id = $1
+                  and coalesce(perimeter_id, home_perimeter_id) = $2
+            `, [companyId, perimeterId]);
 
             return {
                 applicationsDeleted: delApps.rowCount,
@@ -422,6 +518,7 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
 
 adminRouter.get("/candidatures", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
             `
       select
@@ -449,9 +546,14 @@ adminRouter.get("/candidatures", async (req, res, next) => {
       left join roles occ_role on occ_role.id = occ.role_id
       left join locations occ_loc on occ_loc.id = occ.location_id
 
+      where a.company_id = $1
+        and a.perimeter_id = $2
+
       order by a.created_at desc
       limit 500
       `
+            ,
+            [companyId, perimeterId]
         );
 
         return res.json({
@@ -466,19 +568,37 @@ adminRouter.get("/candidatures", async (req, res, next) => {
 
 adminRouter.get("/users", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
             `
       select
-        id,
-        full_name,
-        email,
-        availability_status,
-        location_id,
-        fixed_location,
-        role_id
-      from users
-      order by full_name nulls last, id
+        u.id,
+        u.first_name,
+        u.last_name,
+        u.full_name,
+        u.email,
+        u.availability_status,
+        u.location_id,
+        l.name as location_name,
+        u.fixed_location,
+        u.role_id,
+        r.name as role_name,
+        pm.access_role,
+        u.company_id,
+        u.home_perimeter_id
+      from perimeter_memberships pm
+      join users u on u.id = pm.user_id
+      left join locations l on l.id = u.location_id
+      left join roles r on r.id = u.role_id
+      where pm.company_id = $1
+        and pm.perimeter_id = $2
+        and u.company_id = $1
+        and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+        and coalesce(pm.status, 'active') = 'active'
+      order by u.last_name nulls last, u.first_name nulls last, u.full_name nulls last, u.id
       `
+            ,
+            [companyId, perimeterId]
         );
 
         return res.json({
@@ -493,6 +613,10 @@ adminRouter.get("/users", async (req, res, next) => {
 
 adminRouter.post("/users", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId: (req as any).correlationId ?? null });
+        }
         const correlationId = (req as any).correlationId;
         const { full_name, email } = req.body ?? {};
         if (!full_name || !email) {
@@ -501,11 +625,11 @@ adminRouter.post("/users", async (req, res, next) => {
 
         const { rows } = await pool.query(
             `
-      insert into users (full_name, email, availability_status)
-      values ($1, $2, 'inactive')
-      returning id, full_name, email, availability_status, location_id, fixed_location, role_id
+      insert into users (full_name, email, availability_status, company_id, perimeter_id, home_perimeter_id)
+      values ($1, $2, 'inactive', $3, $4, $4)
+      returning id, full_name, email, availability_status, location_id, fixed_location, role_id, company_id, perimeter_id
       `,
-            [String(full_name), String(email)]
+            [String(full_name), String(email), companyId, perimeterId]
         );
 
         invalidateMapCache();
@@ -519,10 +643,17 @@ adminRouter.delete("/users/:id", async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const userId = req.params.id;
+        const { companyId, perimeterId } = getTenantScope(req);
 
-        await pool.query(`delete from applications where user_id = $1`, [userId]);
+        await pool.query(
+            `delete from applications where user_id = $1 and company_id = $2 and perimeter_id = $3`,
+            [userId, companyId, perimeterId]
+        );
 
-        const del = await pool.query(`delete from users where id = $1`, [userId]);
+        const del = await pool.query(
+            `delete from users where id = $1 and company_id = $2 and coalesce(perimeter_id, home_perimeter_id) = $3`,
+            [userId, companyId, perimeterId]
+        );
 
         invalidateMapCache();
         return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
@@ -535,8 +666,9 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
     try {
         const userId = req.params.id;
         const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
 
-        const { availability_status, location_id, fixed_location, role_id } = req.body ?? {};
+        const { availability_status, location_id, fixed_location, role_id, access_role } = req.body ?? {};
 
         const fields: string[] = [];
         const values: any[] = [];
@@ -558,24 +690,76 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
         if (fixed_location !== undefined) push("fixed_location", !!fixed_location);
         if (role_id !== undefined) push("role_id", role_id || null);
 
-        if (fields.length === 0) {
+        if (fields.length === 0 && access_role === undefined) {
             return res.status(400).json({ ok: false, error: "empty patch", correlationId });
         }
 
-        values.push(userId);
+        values.push(userId, companyId, perimeterId);
 
-        const { rows } = await pool.query(
+        if (access_role !== undefined) {
+            if (!["user", "admin", "admin_user"].includes(access_role)) {
+                return res.status(400).json({ ok: false, error: "invalid access_role", correlationId });
+            }
+            await pool.query(
+                `
+                update perimeter_memberships
+                set access_role = $1
+                where user_id = $2
+                  and company_id = $3
+                  and perimeter_id = $4
+                `,
+                [access_role, userId, companyId, perimeterId]
+            );
+        }
+
+        const { rows } = fields.length > 0 ? await pool.query(
             `
       update users
       set ${fields.join(", ")}
       where id = $${i}
-      returning id, full_name, email, availability_status, location_id, fixed_location, role_id
+        and company_id = $${i + 1}
+        and coalesce(perimeter_id, home_perimeter_id) = $${i + 2}
+      returning id, full_name, email, availability_status, location_id, fixed_location, role_id, company_id, perimeter_id
       `,
             values
-        );
+        ) : { rows: [] as any[] };
+
+        const userFromDb = rows?.[0]
+            ? rows[0]
+            : (await pool.query(
+                `
+                select id, full_name, email, availability_status, location_id, fixed_location, role_id, company_id, perimeter_id
+                from users
+                where id = $1
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                limit 1
+                `,
+                [userId, companyId, perimeterId]
+            )).rows?.[0] ?? null;
+
+        let membershipAccessRole = null;
+        if (userFromDb) {
+            const membershipRes = await pool.query(
+                `
+                select access_role
+                from perimeter_memberships
+                where user_id = $1
+                  and company_id = $2
+                  and perimeter_id = $3
+                limit 1
+                `,
+                [userId, companyId, perimeterId]
+            );
+            membershipAccessRole = membershipRes.rows?.[0]?.access_role ?? null;
+        }
 
         invalidateMapCache();
-        return res.json({ ok: true, user: rows?.[0] ?? null, correlationId });
+        return res.json({
+            ok: true,
+            user: userFromDb ? { ...userFromDb, access_role: membershipAccessRole } : null,
+            correlationId,
+        });
     } catch (e) {
         next(e);
     }
@@ -583,15 +767,18 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
 
 adminRouter.get("/positions", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
       select
         p.id,
         p.title,
         p.occupied_by
       from positions p
+      where p.company_id = $1
+        and p.perimeter_id = $2
       order by p.title asc
       limit 1000
-    `);
+    `, [companyId, perimeterId]);
         return res.json({ ok: true, positions: rows, correlationId: (req as any).correlationId ?? null });
     } catch (e) {
         next(e);
@@ -629,12 +816,15 @@ adminRouter.get("/roles", async (req, res, next) => {
 
 adminRouter.get("/test-scenarios", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
       select id, name
       from test_scenarios
+      where company_id = $1
+        and perimeter_id = $2
       order by created_at asc
       limit 500
-    `);
+    `, [companyId, perimeterId]);
         return res.json({ ok: true, scenarios: rows, correlationId: (req as any).correlationId ?? null });
     } catch (e) {
         next(e);
@@ -648,6 +838,7 @@ adminRouter.get("/test-scenarios/:id/applications", async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const scenarioId = req.params.id;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const { rows } = await pool.query(
             `
@@ -658,9 +849,11 @@ adminRouter.get("/test-scenarios/:id/applications", async (req, res, next) => {
         priority
       from test_scenario_applications
       where scenario_id = $1
+        and company_id = $2
+        and perimeter_id = $3
       order by priority asc, created_at asc nulls last, id asc
       `,
-            [scenarioId]
+            [scenarioId, companyId, perimeterId]
         );
 
         return res.json({ ok: true, applications: rows, correlationId });
@@ -677,6 +870,7 @@ adminRouter.patch("/test-scenarios/:id", async (req: Request, res: Response, nex
         const r = req as unknown as AuthedRequest;
         const correlationId = (req as any).correlationId;
         const scenarioId = req.params.id;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const name = String((req as any).body?.name ?? "").trim();
         if (!name) {
@@ -688,9 +882,11 @@ adminRouter.patch("/test-scenarios/:id", async (req: Request, res: Response, nex
       update test_scenarios
       set name = $1
       where id = $2
+        and company_id = $3
+        and perimeter_id = $4
       returning id, name
       `,
-            [name, scenarioId]
+            [name, scenarioId, companyId, perimeterId]
         );
 
         const scenario = rows?.[0] ?? null;
@@ -710,16 +906,17 @@ adminRouter.delete("/test-scenarios/:id", async (req: Request, res: Response) =>
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
     const scenarioId = req.params.id;
+    const { companyId, perimeterId } = getTenantScope(req);
 
     try {
         const out = await withTx(async (client) => {
             const delApps = await client.query(
-                `delete from test_scenario_applications where scenario_id = $1`,
-                [scenarioId]
+                `delete from test_scenario_applications where scenario_id = $1 and company_id = $2 and perimeter_id = $3`,
+                [scenarioId, companyId, perimeterId]
             );
             const delScenario = await client.query(
-                `delete from test_scenarios where id = $1`,
-                [scenarioId]
+                `delete from test_scenarios where id = $1 and company_id = $2 and perimeter_id = $3`,
+                [scenarioId, companyId, perimeterId]
             );
 
             return {
@@ -755,13 +952,16 @@ adminRouter.delete("/test-scenarios/:id/applications/:appId", async (req, res, n
 
         const scenarioId = req.params.id;
         const appId = req.params.appId;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const del = await pool.query(
             `
       delete from test_scenario_applications
       where id = $1 and scenario_id = $2
+        and company_id = $3
+        and perimeter_id = $4
       `,
-            [appId, scenarioId]
+            [appId, scenarioId, companyId, perimeterId]
         );
 
         const out = { scenarioId, appId, deleted: del.rowCount ?? 0 };
@@ -782,10 +982,11 @@ adminRouter.delete("/test-scenarios/:id/applications", async (req: Request, res:
         const correlationId = (req as any).correlationId;
 
         const scenarioId = req.params.id;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const del = await pool.query(
-            `delete from test_scenario_applications where scenario_id = $1`,
-            [scenarioId]
+            `delete from test_scenario_applications where scenario_id = $1 and company_id = $2 and perimeter_id = $3`,
+            [scenarioId, companyId, perimeterId]
         );
 
         const out = { scenarioId, deleted: del.rowCount ?? 0 };
@@ -799,12 +1000,15 @@ adminRouter.delete("/test-scenarios/:id/applications", async (req: Request, res:
 
 adminRouter.get("/config", async (req, res, next) => {
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
       select max_applications
       from app_config
       where singleton = true
+        and company_id = $1
+        and perimeter_id = $2
       limit 1
-    `);
+    `, [companyId, perimeterId]);
         return res.json({
             ok: true,
             config: rows?.[0] ?? null,
@@ -879,14 +1083,19 @@ adminRouter.delete("/roles/:id", async (req, res, next) => {
 adminRouter.post("/test-scenarios", async (req: Request, res: Response, next) => {
     try {
         const r = req as unknown as AuthedRequest;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const correlationId = (req as any).correlationId;
         const name = String((req as any).body?.name ?? "").trim();
         if (!name) return res.status(400).json({ ok: false, error: "missing name", correlationId });
 
         const { rows } = await pool.query(
-            `insert into test_scenarios (name) values ($1) returning id, name`,
-            [name]
+            `
+            insert into test_scenarios (name, company_id, perimeter_id)
+            values ($1, $2, $3)
+            returning id, name
+            `,
+            [name, companyId, perimeterId]
         );
 
         const scenario = rows[0];
@@ -904,6 +1113,7 @@ adminRouter.post("/test-scenarios", async (req: Request, res: Response, next) =>
 adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: Response, next) => {
     try {
         const r = req as unknown as AuthedRequest;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const correlationId = (req as any).correlationId;
         const scenarioId = req.params.id;
@@ -918,11 +1128,11 @@ adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: R
 
         const { rows } = await pool.query(
             `
-      insert into test_scenario_applications (scenario_id, user_id, position_id, priority)
-      values ($1, $2, $3, $4)
+      insert into test_scenario_applications (scenario_id, user_id, position_id, priority, company_id, perimeter_id)
+      values ($1, $2, $3, $4, $5, $6)
       returning id, scenario_id, user_id, position_id, priority
       `,
-            [scenarioId, user_id, position_id, priority]
+            [scenarioId, user_id, position_id, priority, companyId, perimeterId]
         );
 
         const application = rows[0];
@@ -944,6 +1154,7 @@ adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: R
 adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, next) => {
     try {
         const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
 
         const { rows } = await pool.query(
             `
@@ -965,9 +1176,13 @@ adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, n
               optimal_chains_json,
               created_at
             from interlocking_scenarios
+            where company_id = $1
+              and perimeter_id = $2
             order by generated_at desc, created_at desc
             limit 500
             `
+            ,
+            [companyId, perimeterId]
         );
 
         return res.json({
@@ -975,6 +1190,74 @@ adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, n
             scenarios: rows,
             correlationId,
         });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.get("/interlocking-scenarios/export.csv", async (req: Request, res: Response, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
+
+        const { rows } = await pool.query(
+            `
+            select
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              created_at
+            from interlocking_scenarios
+            where company_id = $1
+              and perimeter_id = $2
+            order by generated_at desc, created_at desc
+            limit 5000
+            `,
+            [companyId, perimeterId]
+        );
+
+        const headers = [
+            "scenario_code",
+            "generated_at",
+            "strategy",
+            "max_len",
+            "total_chains",
+            "unique_people",
+            "coverage",
+            "avg_length",
+            "max_length",
+            "avg_priority",
+            "build_nodes",
+            "build_relationships",
+            "created_at",
+        ];
+
+        const esc = (value: unknown) => {
+            const raw = value == null ? "" : String(value);
+            return `"${raw.replace(/"/g, "\"\"")}"`;
+        };
+
+        const lines = [
+            headers.join(","),
+            ...rows.map((row) => headers.map((h) => esc((row as any)[h])).join(",")),
+        ];
+
+        res.setHeader("Content-Type", "text/csv; charset=utf-8");
+        res.setHeader(
+            "Content-Disposition",
+            `attachment; filename="interlocking-scenarios-${perimeterId}.csv"`
+        );
+        res.setHeader("x-correlation-id", correlationId ?? "");
+        return res.status(200).send(lines.join("\n"));
     } catch (e) {
         next(e);
     }
@@ -988,6 +1271,7 @@ adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) 
     const correlationId = (req as any).correlationId;
 
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const {
             scenario_code,
             generated_at,
@@ -1016,6 +1300,8 @@ adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) 
         const { rows } = await pool.query(
             `
             insert into interlocking_scenarios (
+              company_id,
+              perimeter_id,
               scenario_code,
               generated_at,
               strategy,
@@ -1032,7 +1318,7 @@ adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) 
               optimal_chains_json
             )
             values (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13::jsonb, $14::jsonb
+              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb
             )
             returning
               id,
@@ -1053,6 +1339,8 @@ adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) 
               created_at
             `,
             [
+                companyId,
+                perimeterId,
                 String(scenario_code),
                 generated_at,
                 String(strategy),
@@ -1112,6 +1400,7 @@ adminRouter.delete("/interlocking-scenarios", async (req: Request, res: Response
     const correlationId = (req as any).correlationId;
 
     try {
+        const { companyId, perimeterId } = getTenantScope(req);
         const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
 
         if (ids.length === 0) {
@@ -1126,8 +1415,10 @@ adminRouter.delete("/interlocking-scenarios", async (req: Request, res: Response
             `
             delete from interlocking_scenarios
             where id = any($1::uuid[])
+              and company_id = $2
+              and perimeter_id = $3
             `,
-            [ids]
+            [ids, companyId, perimeterId]
         );
 
         const out = {

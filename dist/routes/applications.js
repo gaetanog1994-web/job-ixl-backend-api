@@ -4,15 +4,13 @@ import { supabaseAdmin } from "../db.js";
 import { invalidateMapCache } from "./map.js";
 import { audit } from "../audit.js";
 export const applicationsRouter = Router();
-/**
- * Conta le candidature logiche dell'utente come gruppi (role_id, location_id) distinti.
- * Una posizione con N occupanti genera N righe ma vale come 1 slot.
- */
-async function countDistinctGroups(userId) {
+async function countDistinctGroupsInPerimeter(userId, companyId, perimeterId) {
     const { data: apps, error: appsErr } = await supabaseAdmin
         .from("applications")
         .select("position_id")
-        .eq("user_id", userId);
+        .eq("user_id", userId)
+        .eq("company_id", companyId)
+        .eq("perimeter_id", perimeterId);
     if (appsErr)
         throw appsErr;
     const positionIds = (apps ?? []).map((r) => r.position_id).filter(Boolean);
@@ -21,7 +19,9 @@ async function countDistinctGroups(userId) {
     const { data: positions, error: posErr } = await supabaseAdmin
         .from("positions")
         .select("id, occupied_by")
-        .in("id", positionIds);
+        .in("id", positionIds)
+        .eq("company_id", companyId)
+        .eq("perimeter_id", perimeterId);
     if (posErr)
         throw posErr;
     const occupantIds = (positions ?? []).map((p) => p.occupied_by).filter(Boolean);
@@ -30,7 +30,8 @@ async function countDistinctGroups(userId) {
     const { data: users, error: usersErr } = await supabaseAdmin
         .from("users")
         .select("id, role_id, location_id")
-        .in("id", occupantIds);
+        .in("id", occupantIds)
+        .eq("company_id", companyId);
     if (usersErr)
         throw usersErr;
     const occupantMap = new Map((users ?? []).map((u) => [u.id, u]));
@@ -66,6 +67,10 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         });
     }
     try {
+        const access = r.accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", message: "perimeter context required" });
+        }
         const positionIdsRaw = req.body?.positionIds;
         const priorityRaw = req.body?.priority;
         const positionIds = Array.from(new Set(Array.isArray(positionIdsRaw)
@@ -82,6 +87,8 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         const { data: config, error: configErr } = await supabaseAdmin
             .from("app_config")
             .select("max_applications")
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId)
             .single();
         if (configErr)
             throw configErr;
@@ -103,14 +110,17 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         const { data: incomingPos, error: inPosErr } = await supabaseAdmin
             .from("positions")
             .select("id, occupied_by")
-            .in("id", positionIds);
+            .in("id", positionIds)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (inPosErr)
             throw inPosErr;
         const incomingOccupantIds = (incomingPos ?? []).map((p) => p.occupied_by).filter(Boolean);
         const { data: incomingUsers, error: inUsersErr } = await supabaseAdmin
             .from("users")
             .select("id, role_id, location_id")
-            .in("id", incomingOccupantIds);
+            .in("id", incomingOccupantIds)
+            .eq("company_id", access.currentCompanyId);
         if (inUsersErr)
             throw inUsersErr;
         const incomingGroups = new Set((incomingUsers ?? []).map((u) => `${u.role_id}__${u.location_id}`));
@@ -119,7 +129,9 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             .from("applications")
             .select("position_id")
             .eq("user_id", targetUserId)
-            .eq("priority", priority);
+            .eq("priority", priority)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (usedErr)
             throw usedErr;
         const usedPositionIds = (used ?? []).map((r) => r.position_id).filter(Boolean);
@@ -128,14 +140,17 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             const { data: usedPos, error: upErr } = await supabaseAdmin
                 .from("positions")
                 .select("id, occupied_by")
-                .in("id", usedPositionIds);
+                .in("id", usedPositionIds)
+                .eq("company_id", access.currentCompanyId)
+                .eq("perimeter_id", access.currentPerimeterId);
             if (upErr)
                 throw upErr;
             const usedOccupantIds = (usedPos ?? []).map((p) => p.occupied_by).filter(Boolean);
             const { data: usedUsers, error: uuErr } = await supabaseAdmin
                 .from("users")
                 .select("id, role_id, location_id")
-                .in("id", usedOccupantIds);
+                .in("id", usedOccupantIds)
+                .eq("company_id", access.currentCompanyId);
             if (uuErr)
                 throw uuErr;
             existingConflict = (usedUsers ?? []).some((u) => !incomingGroups.has(`${u.role_id}__${u.location_id}`));
@@ -151,6 +166,8 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             user_id: targetUserId,
             position_id,
             priority,
+            company_id: access.currentCompanyId,
+            perimeter_id: access.currentPerimeterId,
         }));
         const { error: insErr } = await supabaseAdmin
             .from("applications")
@@ -162,11 +179,13 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             return res.status(409).json({ error: "INSERT_FAILED", message: insErr.message });
         }
         invalidateMapCache(); // ✅ ESATTAMENTE QUI
-        const distinctCount = await countDistinctGroups(targetUserId);
+        const distinctCount = await countDistinctGroupsInPerimeter(targetUserId, access.currentCompanyId, access.currentPerimeterId);
         await supabaseAdmin
             .from("users")
             .update({ application_count: distinctCount })
-            .eq("id", targetUserId);
+            .eq("id", targetUserId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         await audit("applications_bulk_apply", r.user.id, { targetUserId, priority, positionIdsCount: positionIds.length }, { inserted: rows.length, application_count: distinctCount }, correlationId);
         return res.status(200).json({ ok: true, inserted: rows.length });
     }
@@ -191,6 +210,10 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
         });
     }
     try {
+        const access = r.accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", message: "perimeter context required" });
+        }
         const positionIdsRaw = req.body?.positionIds;
         const positionIds = Array.from(new Set(Array.isArray(positionIdsRaw)
             ? positionIdsRaw.map((x) => String(x)).filter(Boolean)
@@ -202,16 +225,20 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
             .from("applications")
             .delete()
             .eq("user_id", targetUserId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId)
             .in("position_id", positionIds);
         if (delErr)
             throw delErr;
         invalidateMapCache();
         // riallinea application_count contando gruppi (role_id, location_id) distinti
-        const distinctCount = await countDistinctGroups(targetUserId);
+        const distinctCount = await countDistinctGroupsInPerimeter(targetUserId, access.currentCompanyId, access.currentPerimeterId);
         await supabaseAdmin
             .from("users")
             .update({ application_count: distinctCount })
-            .eq("id", targetUserId);
+            .eq("id", targetUserId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         await audit("applications_bulk_withdraw", r.user.id, { targetUserId, positionIdsCount: positionIds.length }, { application_count: distinctCount }, correlationId);
         return res.status(200).json({ ok: true, deleted: true, application_count: distinctCount });
     }

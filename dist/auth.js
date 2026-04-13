@@ -1,4 +1,5 @@
 import { createClient } from "@supabase/supabase-js";
+import { loadAccessContext, readRequestedContext } from "./tenant.js";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 if (!SUPABASE_URL)
@@ -33,14 +34,11 @@ export async function requireAuth(req, _res, next) {
 export async function requireAdmin(req, _res, next) {
     try {
         const r = req;
-        const { data, error } = await supabaseAdmin
-            .from("app_admins")
-            .select("user_id")
-            .eq("user_id", r.user.id)
-            .maybeSingle();
-        if (error)
-            return next(httpError(500, "RBAC check failed"));
-        if (!data)
+        if (!r.accessContext) {
+            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
+            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
+        }
+        if (!r.accessContext.canManagePerimeter)
             return next(httpError(403, "Admin only"));
         r.isAdmin = true;
         return next();
@@ -52,16 +50,11 @@ export async function requireAdmin(req, _res, next) {
 export async function attachIsAdmin(req, _res, next) {
     try {
         const r = req;
-        const { data, error } = await supabaseAdmin
-            .from("app_admins")
-            .select("user_id")
-            .eq("user_id", r.user.id)
-            .maybeSingle();
-        if (error) {
-            req.isAdmin = false;
-            return next();
+        if (!r.accessContext) {
+            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
+            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
         }
-        req.isAdmin = !!data;
+        req.isAdmin = r.accessContext.canManagePerimeter === true;
         return next();
     }
     catch {

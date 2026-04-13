@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
+import { requireAuth, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin } from "../db.js";
 
 export const mapRouter = Router();
@@ -9,9 +9,9 @@ type CacheEntry = { expiresAt: number; value: any };
 const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
 const mapCache = new Map<string, CacheEntry>();
 
-function cacheKey(params: { tokenUserId: string; viewerUserId: string; mode: string }) {
+function cacheKey(params: { tokenUserId: string; viewerUserId: string; mode: string; companyId: string; perimeterId: string }) {
     // include tokenUserId to avoid accidental cross-user leakage when viewerUserId omitted
-    return `map:v1:${params.tokenUserId}:${params.viewerUserId}:${params.mode}`;
+    return `map:v2:${params.tokenUserId}:${params.viewerUserId}:${params.companyId}:${params.perimeterId}:${params.mode}`;
 }
 
 function cacheGet(key: string) {
@@ -44,16 +44,27 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
     const tokenUserId = r.user.id;
     const viewerUserId = (req.query.viewerUserId as string) || tokenUserId;
     const mode = (req.query.mode as string) === "to" ? "to" : "from";
+    const access = r.accessContext;
+
+    if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED" });
+    }
 
     // 🔐 Admin enforcement (se provo a vedere un altro user)
     if (viewerUserId !== tokenUserId) {
-        await new Promise<void>((resolve, reject) => {
-            requireAdmin(r, res, (err?: any) => (err ? reject(err) : resolve()));
-        });
+        if (!access.canManagePerimeter) {
+            return res.status(403).json({ error: "PERIMETER_ADMIN_ONLY" });
+        }
     }
 
     // ✅ Cache (solo dopo enforcement admin)
-    const key = cacheKey({ tokenUserId, viewerUserId, mode });
+    const key = cacheKey({
+        tokenUserId,
+        viewerUserId,
+        mode,
+        companyId: access.currentCompanyId,
+        perimeterId: access.currentPerimeterId,
+    });
     const cached = cacheGet(key);
     if (cached) {
         return res.json(cached);
@@ -64,6 +75,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         const { data: config, error: configErr } = await supabaseAdmin
             .from("app_config")
             .select("max_applications")
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId)
             .single();
         if (configErr) throw configErr;
 
@@ -83,14 +96,18 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
       `
             )
             .eq("id", viewerUserId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId)
             .single();
         if (meErr) throw meErr;
 
         // 3) applications del viewer (per usedPriorities)
         const { data: myApplications, error: appsErr } = await supabaseAdmin
             .from("applications")
-            .select("position_id, priority")
-            .eq("user_id", viewerUserId);
+            .select("position_id, priority, company_id, perimeter_id")
+            .eq("user_id", viewerUserId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
         if (appsErr) throw appsErr;
 
         const usedPriorities = (myApplications ?? [])
@@ -118,7 +135,9 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                     )
                 `
                 )
-                .eq("user_id", viewerUserId);
+                .eq("user_id", viewerUserId)
+                .eq("company_id", access.currentCompanyId)
+                .eq("perimeter_id", access.currentPerimeterId);
 
             if (error) throw error;
 
@@ -141,7 +160,9 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             const { data: myPos, error: myPosErr } = await supabaseAdmin
                 .from("positions")
                 .select("id")
-                .eq("occupied_by", viewerUserId);
+                .eq("occupied_by", viewerUserId)
+                .eq("company_id", access.currentCompanyId)
+                .eq("perimeter_id", access.currentPerimeterId);
 
             if (myPosErr) throw myPosErr;
 
@@ -152,7 +173,9 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 const { data: apps, error } = await supabaseAdmin
                     .from("applications")
                     .select("user_id, position_id, priority")
-                    .in("position_id", myPosIds);
+                    .in("position_id", myPosIds)
+                    .eq("company_id", access.currentCompanyId)
+                    .eq("perimeter_id", access.currentPerimeterId);
 
                 if (error) throw error;
 
@@ -200,7 +223,9 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
       )
     `
             )
-            .not("occupied_by", "is", null);
+            .not("occupied_by", "is", null)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId);
 
         if (posErr) throw posErr;
 
@@ -311,6 +336,10 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
                     ? "available"
                     : "inactive",
+            companyId: access.currentCompanyId,
+            companyName: access.currentCompanyName,
+            perimeterId: access.currentPerimeterId,
+            perimeterName: access.currentPerimeterName,
             meLocation: lat != null && lng != null ? { latitude: lat + OFFSET, longitude: lng + OFFSET } : null,
             maxApplications: config.max_applications,
             usedPriorities: Array.from(new Set(usedPriorities)),
