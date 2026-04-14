@@ -219,6 +219,9 @@ export async function loadAccessContext(
         (
             isOwner ||
             directPerimeterMembership ||
+            // Super admins of a company implicitly can access all perimeters of that company.
+            // This is intentional: super_admin manages the company's entire perimeter structure.
+            // If stricter isolation is needed in future, replace this with explicit perimeter membership check.
             (requestedPerimeter?.company_id && companyById.has(requestedPerimeter.company_id))
         )
     );
@@ -228,6 +231,8 @@ export async function loadAccessContext(
         accessRole = "admin_user";
     }
 
+    // currentPerimeterId is required as the first guard — canManagePerimeter is
+    // always false when no perimeter is in scope, even for owner/super_admin.
     const canManagePerimeter = !!(
         currentPerimeterId &&
         canAccessPerimeter &&

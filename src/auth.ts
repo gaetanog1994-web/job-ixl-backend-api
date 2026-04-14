@@ -20,9 +20,10 @@ export type AuthedRequest = Request & {
 };
 
 
-function httpError(status: number, message: string) {
+function httpError(status: number, message: string, code?: string) {
     const e: any = new Error(message);
     e.status = status;
+    if (code) e.code = code;
     return e;
 }
 
@@ -43,26 +44,20 @@ export async function requireAuth(req: Request, _res: Response, next: NextFuncti
     }
 }
 
-export async function requireAdmin(req: Request, _res: Response, next: NextFunction) {
-    try {
-        const r = req as AuthedRequest;
-        if (!r.accessContext) {
-            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
-            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
-        }
-        if (!r.accessContext.canManagePerimeter) return next(httpError(403, "Admin only"));
-        r.isAdmin = true;
-
-        return next();
-    } catch (e: any) {
-        return next(httpError(500, "Admin middleware failed"));
-    }
+export function requireAdmin(req: Request, _res: Response, next: NextFunction) {
+    const r = req as AuthedRequest;
+    // attachAccessContext must run before this middleware.
+    if (!r.accessContext) return next(httpError(403, "Access context missing", "NO_ACCESS_CONTEXT"));
+    if (!r.accessContext.canManagePerimeter) return next(httpError(403, "Admin only"));
+    r.isAdmin = true;
+    return next();
 }
 
 export async function attachIsAdmin(req: Request, _res: Response, next: NextFunction) {
     try {
         const r = req as AuthedRequest;
         if (!r.accessContext) {
+            // attachAccessContext not in chain — load context here as fallback.
             const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
             r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
         }

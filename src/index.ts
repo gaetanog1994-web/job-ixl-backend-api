@@ -207,8 +207,10 @@ const adminLimiter = rateLimit({
 // Stack admin unico
 const adminApi = express.Router();
 
-adminApi.use(requireAuth, adminLimiter, requireAdmin);
-adminApi.use(attachAccessContext, requirePerimeterAdmin);
+// Order: attachAccessContext before requireAdmin to avoid double DB call.
+// requireAdmin reads r.accessContext set by attachAccessContext.
+// requirePerimeterAdmin removed: requireAdmin already enforces canManagePerimeter.
+adminApi.use(requireAuth, adminLimiter, attachAccessContext, requireAdmin);
 
 // 1) rotte admin “normali”
 adminApi.use("/", adminRouter);
