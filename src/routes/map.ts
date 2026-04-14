@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth, type AuthedRequest } from "../auth.js";
-import { supabaseAdmin } from "../db.js";
+import { supabaseAdmin, pool } from "../db.js";
 
 export const mapRouter = Router();
 // --- Simple in-memory cache (product-lite) ---
@@ -71,14 +71,22 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
     }
 
     try {
-        // 1) app_config
-        const { data: config, error: configErr } = await supabaseAdmin
-            .from("app_config")
-            .select("max_applications")
-            .eq("company_id", access.currentCompanyId)
-            .eq("perimeter_id", access.currentPerimeterId)
-            .single();
+        // 1) app_config + campaign_status (parallel)
+        const [{ data: config, error: configErr }, perimeterRes] = await Promise.all([
+            supabaseAdmin
+                .from("app_config")
+                .select("max_applications")
+                .eq("company_id", access.currentCompanyId)
+                .eq("perimeter_id", access.currentPerimeterId)
+                .single(),
+            pool.query(
+                `select campaign_status from perimeters where id = $1 limit 1`,
+                [access.currentPerimeterId]
+            ),
+        ]);
         if (configErr) throw configErr;
+        const campaignStatus: "open" | "closed" =
+            perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
 
         // 2) viewer user (status + coords via locations)
         const { data: me, error: meErr } = await supabaseAdmin
@@ -332,6 +340,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             viewerUserId,
             viewerRoleId: me?.role_id ?? null,
             viewerLocationId: me?.location_id ?? null,
+            campaign_status: campaignStatus,
             myStatus:
                 (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
                     ? "available"

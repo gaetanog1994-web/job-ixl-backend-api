@@ -516,6 +516,60 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
     }
 });
 
+/**
+ * GET /api/admin/campaign-status
+ */
+adminRouter.get("/campaign-status", async (req: Request, res: Response) => {
+    try {
+        const { perimeterId } = getTenantScope(req);
+        const correlationId = (req as any).correlationId;
+        if (!perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const { rows } = await pool.query(
+            `select campaign_status from perimeters where id = $1 limit 1`,
+            [perimeterId]
+        );
+        if (!rows.length) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        return res.json({ ok: true, campaign_status: rows[0].campaign_status, correlationId });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+    }
+});
+
+/**
+ * PATCH /api/admin/campaign-status
+ * Body: { campaign_status: 'open' | 'closed' }
+ */
+adminRouter.patch("/campaign-status", async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    try {
+        const { perimeterId } = getTenantScope(req);
+        if (!perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const newStatus = req.body?.campaign_status;
+        if (newStatus !== "open" && newStatus !== "closed") {
+            return res.status(400).json({ ok: false, error: "campaign_status must be 'open' or 'closed'", correlationId });
+        }
+        const { rows } = await pool.query(
+            `update perimeters set campaign_status = $1 where id = $2 returning campaign_status`,
+            [newStatus, perimeterId]
+        );
+        if (!rows.length) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        invalidateMapCache();
+        await audit("admin_update_campaign_status", r.user.id, { perimeterId }, { campaign_status: newStatus }, correlationId);
+        return res.json({ ok: true, campaign_status: rows[0].campaign_status, correlationId });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+    }
+});
+
 adminRouter.get("/candidatures", async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
