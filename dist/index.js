@@ -63,12 +63,6 @@ app.use(cors({
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(correlation);
-// ✅ DOPO CORS
-app.use("/api/platform", requireAuth, attachAccessContext, platformRouter);
-app.use("/api/users", requireAuth, attachAccessContext, requireTenantScope, usersRouter);
-app.use("/api/map", requireAuth, attachAccessContext, requirePerimeterAccess, mapRouter);
-app.use("/api", requireAuth, attachAccessContext, requireTenantScope, applicationsRouter);
-app.use("/api/public", publicRouter);
 app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
     const r = req;
     res.json({
@@ -79,6 +73,14 @@ app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
         access: r.accessContext ?? null,
     });
 });
+// ✅ DOPO CORS
+// Keep /api/me above generic /api middleware, otherwise requireTenantScope
+// can intercept it and incorrectly return PERIMETER_CONTEXT_REQUIRED.
+app.use("/api/platform", requireAuth, attachAccessContext, platformRouter);
+app.use("/api/users", requireAuth, attachAccessContext, requireTenantScope, usersRouter);
+app.use("/api/map", requireAuth, attachAccessContext, requirePerimeterAccess, mapRouter);
+app.use("/api", requireAuth, attachAccessContext, requireTenantScope, applicationsRouter);
+app.use("/api/public", publicRouter);
 app.get("/api/config", requireAuth, attachAccessContext, requirePerimeterAccess, async (req, res, next) => {
     try {
         const access = req.accessContext;
