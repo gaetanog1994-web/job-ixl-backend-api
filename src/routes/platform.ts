@@ -131,6 +131,48 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
     }
 });
 
+platformRouter.patch("/companies/:companyId", requireCompanyAdmin, async (req, res, next) => {
+    const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId ?? null;
+
+    try {
+        const access = r.accessContext;
+        const companyId = req.params.companyId;
+        const name = String(req.body?.name ?? "").trim();
+
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing company name", correlationId });
+        }
+
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({
+                ok: false,
+                error: "Company scope mismatch",
+                correlationId,
+            });
+        }
+
+        const { rows } = await pool.query(
+            `
+            update companies
+            set name = $1
+            where id = $2
+            returning id, name, slug, status, created_at
+            `,
+            [name, companyId]
+        );
+
+        if (!rows?.[0]) {
+            return res.status(404).json({ ok: false, error: "Company not found", correlationId });
+        }
+
+        await audit("company_rename", r.user.id, { companyId, name }, { company: rows[0] }, correlationId);
+        return res.json({ ok: true, company: rows[0], correlationId });
+    } catch (error) {
+        next(error);
+    }
+});
+
 platformRouter.get("/companies/:companyId/perimeters", async (req, res, next) => {
     try {
         const access = (req as unknown as AuthedRequest).accessContext;
