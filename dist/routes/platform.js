@@ -106,6 +106,39 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
         next(error);
     }
 });
+platformRouter.patch("/companies/:companyId", requireCompanyAdmin, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const access = r.accessContext;
+        const companyId = req.params.companyId;
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing company name", correlationId });
+        }
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({
+                ok: false,
+                error: "Company scope mismatch",
+                correlationId,
+            });
+        }
+        const { rows } = await pool.query(`
+            update companies
+            set name = $1
+            where id = $2
+            returning id, name, slug, status, created_at
+            `, [name, companyId]);
+        if (!rows?.[0]) {
+            return res.status(404).json({ ok: false, error: "Company not found", correlationId });
+        }
+        await audit("company_rename", r.user.id, { companyId, name }, { company: rows[0] }, correlationId);
+        return res.json({ ok: true, company: rows[0], correlationId });
+    }
+    catch (error) {
+        next(error);
+    }
+});
 platformRouter.get("/companies/:companyId/perimeters", async (req, res, next) => {
     try {
         const access = req.accessContext;
@@ -130,6 +163,112 @@ platformRouter.get("/companies/:companyId/perimeters", async (req, res, next) =>
             order by p.name asc
             `, [companyId]);
         return res.json({ ok: true, perimeters: rows, correlationId: req.correlationId ?? null });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.get("/companies/:companyId/super-admins", requireOwner, async (req, res, next) => {
+    try {
+        const companyId = req.params.companyId;
+        const { rows } = await pool.query(`
+            select
+              cm.user_id as id,
+              u.full_name,
+              u.email,
+              cm.role,
+              cm.status
+            from company_memberships cm
+            join users u on u.id = cm.user_id
+            where cm.company_id = $1
+              and cm.role = 'super_admin'
+              and coalesce(cm.status, 'active') = 'active'
+            order by u.full_name asc nulls last, u.email asc nulls last, cm.user_id
+            `, [companyId]);
+        return res.json({ ok: true, super_admins: rows, correlationId: req.correlationId ?? null });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.post("/companies/:companyId/super-admins", requireOwner, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const companyId = req.params.companyId;
+        const firstName = String(req.body?.first_name ?? "").trim();
+        const lastName = String(req.body?.last_name ?? "").trim();
+        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const fullName = splitName(firstName, lastName);
+        if (!firstName || !lastName || !email) {
+            return res.status(400).json({ ok: false, error: "missing super admin data", correlationId });
+        }
+        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+            data: {
+                first_name: firstName,
+                last_name: lastName,
+                full_name: fullName,
+            },
+        });
+        if (error)
+            throw new Error(error.message);
+        const invitedUserId = data.user?.id;
+        if (!invitedUserId)
+            throw new Error("Invite returned no user id");
+        await withTx(async (client) => {
+            await client.query(`
+                insert into users (
+                  id, email, first_name, last_name, full_name, availability_status,
+                  application_count, company_id, created_by, updated_by
+                )
+                values ($1, $2, $3, $4, $5, 'inactive', 0, $6, $7, $7)
+                on conflict (id) do update
+                  set email = excluded.email,
+                      first_name = excluded.first_name,
+                      last_name = excluded.last_name,
+                      full_name = excluded.full_name,
+                      company_id = excluded.company_id,
+                      updated_by = excluded.updated_by
+                `, [invitedUserId, email, firstName, lastName, fullName, companyId, r.user.id]);
+            await client.query(`
+                insert into company_memberships (company_id, user_id, role, status, created_by)
+                values ($1, $2, 'super_admin', 'active', $3)
+                on conflict (company_id, user_id, role) do update
+                  set status = 'active'
+                `, [companyId, invitedUserId, r.user.id]);
+        });
+        await audit("owner_add_super_admin", r.user.id, { companyId, email }, { user_id: invitedUserId }, correlationId);
+        return res.status(201).json({
+            ok: true,
+            super_admin: {
+                id: invitedUserId,
+                full_name: fullName,
+                email,
+                role: "super_admin",
+                status: "active",
+            },
+            correlationId,
+        });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.delete("/companies/:companyId/super-admins/:userId", requireOwner, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const companyId = req.params.companyId;
+        const userId = req.params.userId;
+        await pool.query(`
+            update company_memberships
+            set status = 'inactive'
+            where company_id = $1
+              and user_id = $2
+              and role = 'super_admin'
+            `, [companyId, userId]);
+        await audit("owner_remove_super_admin", r.user.id, { companyId, userId }, { ok: true }, correlationId);
+        return res.json({ ok: true, correlationId });
     }
     catch (error) {
         next(error);
@@ -161,6 +300,162 @@ platformRouter.post("/companies/:companyId/perimeters", requireCompanyAdmin, asy
         const perimeter = rows[0];
         await audit("company_create_perimeter", r.user.id, { companyId, name }, { perimeter }, correlationId);
         return res.status(201).json({ ok: true, perimeter, correlationId });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.patch("/companies/:companyId/perimeters/:perimeterId", requireCompanyAdmin, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const access = r.accessContext;
+        const companyId = req.params.companyId;
+        const perimeterId = req.params.perimeterId;
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing perimeter name", correlationId });
+        }
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        }
+        const { rows } = await pool.query(`
+            update perimeters
+            set name = $1
+            where id = $2
+              and company_id = $3
+            returning id, company_id, name, slug, status, created_at
+            `, [name, perimeterId, companyId]);
+        if (!rows?.[0]) {
+            return res.status(404).json({ ok: false, error: "Perimeter not found", correlationId });
+        }
+        await audit("perimeter_rename", r.user.id, { companyId, perimeterId, name }, { perimeter: rows[0] }, correlationId);
+        return res.json({ ok: true, perimeter: rows[0], correlationId });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.get("/companies/:companyId/perimeters/:perimeterId/admins", requireCompanyAdmin, async (req, res, next) => {
+    try {
+        const access = req.accessContext;
+        const companyId = req.params.companyId;
+        const perimeterId = req.params.perimeterId;
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId: req.correlationId ?? null });
+        }
+        const { rows } = await pool.query(`
+            select
+              pm.user_id as id,
+              u.full_name,
+              u.email,
+              pm.access_role,
+              pm.status
+            from perimeter_memberships pm
+            join users u on u.id = pm.user_id
+            where pm.company_id = $1
+              and pm.perimeter_id = $2
+              and pm.access_role in ('admin', 'admin_user')
+              and coalesce(pm.status, 'active') = 'active'
+            order by u.full_name asc nulls last, u.email asc nulls last, pm.user_id
+            `, [companyId, perimeterId]);
+        return res.json({ ok: true, admins: rows, correlationId: req.correlationId ?? null });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.post("/companies/:companyId/perimeters/:perimeterId/admins", requireCompanyAdmin, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const access = r.accessContext;
+        const companyId = req.params.companyId;
+        const perimeterId = req.params.perimeterId;
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        }
+        const firstName = String(req.body?.first_name ?? "").trim();
+        const lastName = String(req.body?.last_name ?? "").trim();
+        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const fullName = splitName(firstName, lastName);
+        if (!firstName || !lastName || !email) {
+            return res.status(400).json({ ok: false, error: "missing admin data", correlationId });
+        }
+        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+            data: {
+                first_name: firstName,
+                last_name: lastName,
+                full_name: fullName,
+            },
+        });
+        if (error)
+            throw new Error(error.message);
+        const invitedUserId = data.user?.id;
+        if (!invitedUserId)
+            throw new Error("Invite returned no user id");
+        await withTx(async (client) => {
+            await client.query(`
+                insert into users (
+                  id, email, first_name, last_name, full_name, availability_status,
+                  application_count, company_id, perimeter_id, home_perimeter_id, created_by, updated_by
+                )
+                values ($1, $2, $3, $4, $5, 'inactive', 0, $6, $7, $7, $8, $8)
+                on conflict (id) do update
+                  set email = excluded.email,
+                      first_name = excluded.first_name,
+                      last_name = excluded.last_name,
+                      full_name = excluded.full_name,
+                      company_id = excluded.company_id,
+                      perimeter_id = coalesce(users.perimeter_id, excluded.perimeter_id),
+                      home_perimeter_id = coalesce(users.home_perimeter_id, excluded.home_perimeter_id),
+                      updated_by = excluded.updated_by
+                `, [invitedUserId, email, firstName, lastName, fullName, companyId, perimeterId, r.user.id]);
+            await client.query(`
+                insert into perimeter_memberships (company_id, perimeter_id, user_id, access_role, status, created_by)
+                values ($1, $2, $3, 'admin_user', 'active', $4)
+                on conflict (perimeter_id, user_id) do update
+                  set access_role = 'admin_user',
+                      status = 'active'
+                `, [companyId, perimeterId, invitedUserId, r.user.id]);
+        });
+        await audit("company_add_perimeter_admin", r.user.id, { companyId, perimeterId, email }, { user_id: invitedUserId }, correlationId);
+        return res.status(201).json({
+            ok: true,
+            admin: {
+                id: invitedUserId,
+                full_name: fullName,
+                email,
+                access_role: "admin_user",
+                status: "active",
+            },
+            correlationId,
+        });
+    }
+    catch (error) {
+        next(error);
+    }
+});
+platformRouter.delete("/companies/:companyId/perimeters/:perimeterId/admins/:userId", requireCompanyAdmin, async (req, res, next) => {
+    const r = req;
+    const correlationId = req.correlationId ?? null;
+    try {
+        const access = r.accessContext;
+        const companyId = req.params.companyId;
+        const perimeterId = req.params.perimeterId;
+        const userId = req.params.userId;
+        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        }
+        await pool.query(`
+            update perimeter_memberships
+            set access_role = 'user'
+            where company_id = $1
+              and perimeter_id = $2
+              and user_id = $3
+            `, [companyId, perimeterId, userId]);
+        await audit("company_remove_perimeter_admin", r.user.id, { companyId, perimeterId, userId }, { ok: true }, correlationId);
+        return res.json({ ok: true, correlationId });
     }
     catch (error) {
         next(error);

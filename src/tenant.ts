@@ -168,20 +168,20 @@ export async function loadAccessContext(
         }
         : null;
 
-    if (
+    const hasScopeMismatch = !!(
         requestedCompanyId &&
         requestedPerimeter &&
         requestedPerimeter.company_id !== requestedCompanyId
-    ) {
-        throw httpError(
-            400,
-            "Requested company does not match requested perimeter",
-            "TENANT_SCOPE_MISMATCH"
-        );
-    }
+    );
 
-    let currentCompanyId = requestedCompanyId;
-    let currentCompanyName: string | null = requestedCompanyId ? companyById.get(requestedCompanyId)?.company_name ?? null : null;
+    // Be resilient to stale frontend headers: if company and perimeter mismatch,
+    // trust the perimeter's owning company and continue without hard-failing /api/me.
+    let currentCompanyId = hasScopeMismatch
+        ? requestedPerimeter?.company_id ?? requestedCompanyId
+        : requestedCompanyId;
+    let currentCompanyName: string | null = currentCompanyId
+        ? companyById.get(currentCompanyId)?.company_name ?? requestedPerimeter?.company_name ?? null
+        : null;
     let currentPerimeterId = requestedPerimeterId;
     let currentPerimeterName: string | null = requestedPerimeterId ? perimeterById.get(requestedPerimeterId)?.perimeter_name ?? requestedPerimeter?.perimeter_name ?? null : null;
 
