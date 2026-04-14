@@ -217,6 +217,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         id,
         full_name,
         availability_status,
+        fixed_location,
         role_id,
         roles:role_id (
           name
@@ -251,6 +252,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                     {
                         role_id: string;
                         role_name: string;
+                        fixed_location: boolean;
                         applied: boolean;
                         priority: number | null;
                         users: Array<{ id: string; full_name: string; position_id: string }>;
@@ -296,14 +298,20 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 };
             }
 
+            const isFixed = !!(u as any).fixed_location;
+
             if (!byLocation[loc.id].roles[roleId]) {
                 byLocation[loc.id].roles[roleId] = {
                     role_id: roleId,
                     role_name: roleName,
+                    fixed_location: isFixed,
                     applied: false,
                     priority: null,
                     users: [],
                 };
+            } else {
+                // role is fixed if ANY occupant has fixed_location = true
+                if (isFixed) byLocation[loc.id].roles[roleId].fixed_location = true;
             }
 
             byLocation[loc.id].roles[roleId].users.push({
