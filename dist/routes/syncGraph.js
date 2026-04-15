@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
+import { audit } from "../audit.js";
+import { classifyGraphFailure, reportError } from "../observability.js";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL;
@@ -24,6 +26,7 @@ export const syncGraphRouter = Router();
  */
 syncGraphRouter.post("/", async (req, res) => {
     const correlationId = req.correlationId;
+    const actorId = req.user?.id ?? "unknown";
     try {
         const access = req.accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
@@ -36,6 +39,14 @@ syncGraphRouter.post("/", async (req, res) => {
             .eq("company_id", access.currentCompanyId)
             .eq("perimeter_id", access.currentPerimeterId);
         if (appsErr) {
+            await reportError({
+                event: "graph_sync_read_applications_failed",
+                message: appsErr.message,
+                correlationId,
+                status: 500,
+                code: "GRAPH_SYNC_READ_APPS_FAILED",
+                operation: "sync_graph_read_applications",
+            });
             return res.status(500).json({ error: appsErr.message, correlationId });
         }
         const positionIds = Array.from(new Set((apps ?? []).map((a) => a.position_id).filter(Boolean)));
@@ -47,6 +58,14 @@ syncGraphRouter.post("/", async (req, res) => {
             .eq("company_id", access.currentCompanyId)
             .eq("perimeter_id", access.currentPerimeterId);
         if (posErr) {
+            await reportError({
+                event: "graph_sync_read_positions_failed",
+                message: posErr.message,
+                correlationId,
+                status: 500,
+                code: "GRAPH_SYNC_READ_POSITIONS_FAILED",
+                operation: "sync_graph_read_positions",
+            });
             return res.status(500).json({ error: posErr.message, correlationId });
         }
         const posToOccupant = new Map((positions ?? []).map((p) => [p.id, p.occupied_by]));
@@ -68,6 +87,14 @@ syncGraphRouter.post("/", async (req, res) => {
             .eq("company_id", access.currentCompanyId)
             .eq("perimeter_id", access.currentPerimeterId);
         if (usersErr) {
+            await reportError({
+                event: "graph_sync_read_users_failed",
+                message: usersErr.message,
+                correlationId,
+                status: 500,
+                code: "GRAPH_SYNC_READ_USERS_FAILED",
+                operation: "sync_graph_read_users",
+            });
             return res.status(500).json({ error: usersErr.message, correlationId });
         }
         const usersById = {};
@@ -107,14 +134,55 @@ syncGraphRouter.post("/", async (req, res) => {
             }),
         });
         const buildJson = await buildRes.json().catch(() => null);
+        const buildPayload = typeof buildJson === "object" && buildJson !== null
+            ? buildJson
+            : null;
         if (!buildRes.ok) {
-            return res.status(502).json({
-                error: "Graph engine build-graph failed",
+            const failure = classifyGraphFailure(buildRes.status, buildJson);
+            const mappedStatus = failure.code === "GRAPH_WARMUP_WAIT" ? 503 : 502;
+            const retryAfter = buildRes.headers.get("retry-after");
+            if (retryAfter)
+                res.setHeader("Retry-After", retryAfter);
+            await reportError({
+                event: "graph_sync_build_failed",
+                message: String(buildPayload?.message ?? "Graph build failed"),
+                correlationId,
+                status: mappedStatus,
+                code: failure.code,
+                operation: "sync_graph_build_graph",
+                meta: {
+                    upstreamStatus: buildRes.status,
+                    category: failure.category,
+                },
+            });
+            await audit("graph_sync_rebuild", actorId, {
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            }, {
+                ok: false,
+                code: failure.code,
+                upstreamStatus: buildRes.status,
+            }, correlationId);
+            return res.status(mappedStatus).json({
+                error: failure.code,
+                message: failure.code === "GRAPH_WARMUP_WAIT"
+                    ? "Neo4j is waking up, retry in a few seconds"
+                    : "Graph engine build-graph failed",
                 engineStatus: buildRes.status,
                 engineBody: buildJson,
                 correlationId,
             });
         }
+        await audit("graph_sync_rebuild", actorId, {
+            companyId: access.currentCompanyId,
+            perimeterId: access.currentPerimeterId,
+        }, {
+            ok: true,
+            applicationsRead: apps?.length ?? 0,
+            edgesBuilt: edges.length,
+            usersMapped: Object.keys(usersById).length,
+            upstreamStatus: buildRes.status,
+        }, correlationId);
         return res.status(200).json({
             ok: true,
             correlationId,
@@ -128,6 +196,15 @@ syncGraphRouter.post("/", async (req, res) => {
         });
     }
     catch (e) {
+        await reportError({
+            event: "graph_sync_unhandled_failed",
+            message: e?.message ?? String(e),
+            correlationId,
+            status: 500,
+            code: "GRAPH_SYNC_UNHANDLED",
+            operation: "sync_graph_rebuild",
+        });
+        await audit("graph_sync_rebuild", actorId, {}, { ok: false, error: e?.message ?? String(e) }, correlationId);
         return res.status(500).json({ error: e?.message ?? String(e), correlationId });
     }
 });

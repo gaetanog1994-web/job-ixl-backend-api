@@ -3,6 +3,7 @@ import { pool, supabaseAdmin, withTx } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { requireCompanyAdmin, requireOwner } from "../tenant.js";
 import { audit } from "../audit.js";
+import { getOrInviteUserByEmail, normalizeEmailInput } from "../services/authUsers.js";
 
 export const platformRouter = Router();
 
@@ -52,7 +53,7 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
         const name = String(req.body?.name ?? "").trim();
         const firstName = String(req.body?.first_super_admin?.first_name ?? "").trim();
         const lastName = String(req.body?.first_super_admin?.last_name ?? "").trim();
-        const email = String(req.body?.first_super_admin?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.first_super_admin?.email);
 
         if (!name || !firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing company or super admin data", correlationId });
@@ -71,17 +72,15 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
                 [name, slug || `company-${Date.now()}`, r.user.id]
             );
 
-            const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-                data: {
+            const { userId: invitedUserId } = await getOrInviteUserByEmail({
+                authAdmin: supabaseAdmin.auth.admin,
+                email,
+                metadata: {
                     first_name: firstName,
                     last_name: lastName,
                     full_name: fullName,
                 },
             });
-
-            if (error) throw new Error(error.message);
-            const invitedUserId = data.user?.id;
-            if (!invitedUserId) throw new Error("Invite returned no user id");
 
             const companyId = companyInsert.rows[0].id;
 
@@ -245,23 +244,22 @@ platformRouter.post("/companies/:companyId/super-admins", requireOwner, async (r
         const companyId = req.params.companyId;
         const firstName = String(req.body?.first_name ?? "").trim();
         const lastName = String(req.body?.last_name ?? "").trim();
-        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.email);
         const fullName = splitName(firstName, lastName);
 
         if (!firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing super admin data", correlationId });
         }
 
-        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-            data: {
+        const { userId: invitedUserId } = await getOrInviteUserByEmail({
+            authAdmin: supabaseAdmin.auth.admin,
+            email,
+            metadata: {
                 first_name: firstName,
                 last_name: lastName,
                 full_name: fullName,
             },
         });
-        if (error) throw new Error(error.message);
-        const invitedUserId = data.user?.id;
-        if (!invitedUserId) throw new Error("Invite returned no user id");
 
         await withTx(async (client) => {
             await client.query(
@@ -464,23 +462,22 @@ platformRouter.post("/companies/:companyId/perimeters/:perimeterId/admins", requ
 
         const firstName = String(req.body?.first_name ?? "").trim();
         const lastName = String(req.body?.last_name ?? "").trim();
-        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.email);
         const fullName = splitName(firstName, lastName);
 
         if (!firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing admin data", correlationId });
         }
 
-        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-            data: {
+        const { userId: invitedUserId } = await getOrInviteUserByEmail({
+            authAdmin: supabaseAdmin.auth.admin,
+            email,
+            metadata: {
                 first_name: firstName,
                 last_name: lastName,
                 full_name: fullName,
             },
         });
-        if (error) throw new Error(error.message);
-        const invitedUserId = data.user?.id;
-        if (!invitedUserId) throw new Error("Invite returned no user id");
 
         await withTx(async (client) => {
             await client.query(

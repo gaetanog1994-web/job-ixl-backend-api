@@ -3,6 +3,7 @@ import { requireAuth, requireAdmin, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin, pool } from "../db.js";
 import { invalidateMapCache } from "./map.js";
 import { audit } from "../audit.js";
+import { countDistinctGroups } from "../services/countDistinctGroups.js";
 
 export const applicationsRouter = Router();
 
@@ -36,13 +37,11 @@ async function countDistinctGroupsInPerimeter(userId: string, companyId: string,
         .eq("company_id", companyId);
     if (usersErr) throw usersErr;
 
-    const occupantMap = new Map((users ?? []).map((u: any) => [u.id, u]));
-    const groups = new Set<string>();
-    for (const pos of positions ?? []) {
-        const u = occupantMap.get((pos as any).occupied_by);
-        if (u) groups.add(`${(u as any).role_id}__${(u as any).location_id}`);
-    }
-    return groups.size;
+    return countDistinctGroups({
+        positionIds,
+        positions: (positions ?? []) as Array<{ id: string; occupied_by: string | null }>,
+        occupants: (users ?? []) as Array<{ id: string; role_id: string | null; location_id: string | null }>,
+    });
 }
 
 /**

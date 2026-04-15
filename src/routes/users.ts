@@ -2,7 +2,8 @@ import type { Router, Request, Response, NextFunction } from "express";
 import { type AuthedRequest } from "../auth.js";
 import { pool, withTx } from "../db.js";
 import { audit } from "../audit.js";
-import { invalidateMapCache } from "./map.js"; // aggiusta path corretto
+import { invalidateMapCache } from "./map.js";
+import { deactivateUserAndCleanup } from "../services/users.js";
 
 
 // src/routes/users.ts
@@ -211,43 +212,25 @@ usersRouter.get("/me/applications", async (req, res, next) => {
 
 /**
  * POST /api/users/me/deactivate
- * Self-service: l'utente diventa "inactive" + cleanup delle sue applications
+ * Self-service: l'utente diventa "inactive" + cleanup COMPLETO delle sue applications.
+ * Uses deactivateUserAndCleanup service — deletes both outgoing AND incoming applications
+ * and recalculates application_count for affected users.
  */
 usersRouter.post("/me/deactivate", async (req, res) => {
-
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
+    const companyId = r.accessContext?.currentCompanyId ?? null;
+    const perimeterId = r.accessContext?.currentPerimeterId ?? null;
+
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
 
     try {
-        const out = await withTx(async (client) => {
-            const access = r.accessContext;
-            await client.query(
-                `delete from applications where user_id = $1 and company_id = $2 and perimeter_id = $3`,
-                [r.user.id, access?.currentCompanyId ?? null, access?.currentPerimeterId ?? null]
-            );
-
-            const upd = await client.query(
-                `update users
-                    set availability_status = 'inactive',
-                        show_position = false,
-                        application_count = 0,
-                        updated_by = $1
-                    where id = $1
-                      and company_id = $2
-                      and coalesce(perimeter_id, home_perimeter_id) = $3
-                    returning id, availability_status, show_position
-                `,
-                [r.user.id, r.accessContext?.currentCompanyId ?? null, r.accessContext?.currentPerimeterId ?? null]
-            );
-
-            return {
-                userId: r.user.id,
-                status: upd.rows?.[0]?.availability_status ?? "inactive",
-                showPosition: upd.rows?.[0]?.show_position ?? false,
-            };
-
+        const out = await deactivateUserAndCleanup(r.user.id, companyId, perimeterId, {
+            actorId: r.user.id,
+            setShowPositionFalse: true, // self-deactivate also hides user from map
         });
-        invalidateMapCache();
         await audit("user_deactivate_self", r.user.id, {}, out, correlationId);
         return res.status(200).json({ ok: true, out, correlationId });
     } catch (e: any) {
@@ -256,6 +239,100 @@ usersRouter.post("/me/deactivate", async (req, res) => {
     }
 });
 
+
+/**
+ * POST /api/users/:userId/reorder-applications
+ * Reorder application priorities for a user.
+ * Replaces Supabase RPC reorder_user_applications() — now fully in-backend.
+ *
+ * Body: { updates: [{ app_ids: string[], priority: number }] }
+ * Each entry sets the same priority on all listed application IDs.
+ *
+ * Validation:
+ * - User can only reorder their own applications (unless admin).
+ * - priority must be 1..max_applications from app_config.
+ * - All app_ids must belong to the requesting user + current tenant.
+ */
+usersRouter.post("/:userId/reorder-applications", async (req: Request, res: Response, next: NextFunction) => {
+    const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    const tokenUserId = r.user.id;
+    const targetUserId = req.params.userId;
+    const access = r.accessContext;
+
+    // Only the user themselves (or admin) can reorder
+    if (targetUserId !== tokenUserId && !access?.canManagePerimeter) {
+        return res.status(403).json({ error: "FORBIDDEN", message: "Cannot reorder applications for another user", correlationId });
+    }
+
+    if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+
+    const updates: { app_ids: string[]; priority: number }[] = req.body?.updates;
+    if (!Array.isArray(updates) || updates.length === 0) {
+        return res.status(400).json({ error: "INVALID_BODY", message: "updates must be a non-empty array", correlationId });
+    }
+
+    // Validate each update entry
+    for (const u of updates) {
+        if (!Array.isArray(u.app_ids) || u.app_ids.length === 0 || typeof u.priority !== "number") {
+            return res.status(400).json({
+                error: "INVALID_BODY",
+                message: "Each update must have app_ids (string[]) and priority (number)",
+                correlationId,
+            });
+        }
+        if (!Number.isFinite(u.priority) || u.priority < 1) {
+            return res.status(400).json({
+                error: "INVALID_PRIORITY",
+                message: "priority must be >= 1",
+                correlationId,
+            });
+        }
+    }
+
+    try {
+        // Fetch max_applications for upper bound validation
+        const { rows: configRows } = await pool.query(
+            `SELECT max_applications FROM app_config
+             WHERE singleton = true AND company_id = $1 AND perimeter_id = $2 LIMIT 1`,
+            [access.currentCompanyId, access.currentPerimeterId]
+        );
+        const maxApplications = Number(configRows[0]?.max_applications ?? 0);
+
+        for (const u of updates) {
+            if (maxApplications > 0 && u.priority > maxApplications) {
+                return res.status(400).json({
+                    error: "INVALID_PRIORITY",
+                    message: `priority ${u.priority} exceeds max_applications (${maxApplications})`,
+                    correlationId,
+                });
+            }
+        }
+
+        // Apply all updates in a transaction, scoped to user + tenant
+        await withTx(async (client) => {
+            for (const u of updates) {
+                await client.query(
+                    `UPDATE applications
+                     SET    priority = $1
+                     WHERE  id         = ANY($2::uuid[])
+                       AND  user_id    = $3
+                       AND  company_id = $4
+                       AND  perimeter_id = $5`,
+                    [u.priority, u.app_ids, targetUserId, access.currentCompanyId, access.currentPerimeterId]
+                );
+            }
+        });
+
+        invalidateMapCache();
+        await audit("applications_reorder", r.user.id, { targetUserId, updatesCount: updates.length }, {}, correlationId);
+        return res.status(200).json({ ok: true, correlationId });
+    } catch (e: any) {
+        return next(e);
+    }
+});
 
 /**
  * POST /api/users/me/activate

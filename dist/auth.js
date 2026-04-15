@@ -9,9 +9,11 @@ if (!SUPABASE_SERVICE_ROLE_KEY)
 const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
 });
-function httpError(status, message) {
+function httpError(status, message, code) {
     const e = new Error(message);
     e.status = status;
+    if (code)
+        e.code = code;
     return e;
 }
 export async function requireAuth(req, _res, next) {
@@ -31,26 +33,21 @@ export async function requireAuth(req, _res, next) {
         return next(httpError(500, "Auth middleware failed"));
     }
 }
-export async function requireAdmin(req, _res, next) {
-    try {
-        const r = req;
-        if (!r.accessContext) {
-            const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
-            r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
-        }
-        if (!r.accessContext.canManagePerimeter)
-            return next(httpError(403, "Admin only"));
-        r.isAdmin = true;
-        return next();
-    }
-    catch (e) {
-        return next(httpError(500, "Admin middleware failed"));
-    }
+export function requireAdmin(req, _res, next) {
+    const r = req;
+    // attachAccessContext must run before this middleware.
+    if (!r.accessContext)
+        return next(httpError(403, "Access context missing", "NO_ACCESS_CONTEXT"));
+    if (!r.accessContext.canManagePerimeter)
+        return next(httpError(403, "Admin only"));
+    r.isAdmin = true;
+    return next();
 }
 export async function attachIsAdmin(req, _res, next) {
     try {
         const r = req;
         if (!r.accessContext) {
+            // attachAccessContext not in chain — load context here as fallback.
             const { requestedCompanyId, requestedPerimeterId } = readRequestedContext(req);
             r.accessContext = await loadAccessContext(r.user.id, requestedCompanyId, requestedPerimeterId);
         }

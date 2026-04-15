@@ -1,5 +1,6 @@
 import crypto from "crypto";
 import { pool } from "./db.js"; // ✅ NO .js (evita risoluzioni ambigue in dev con tsx)
+import { reportError } from "./observability.js";
 export function correlation(req, res, next) {
     const raw = req.headers["x-correlation-id"];
     const incoming = Array.isArray(raw) ? raw[0] : raw;
@@ -23,12 +24,14 @@ export async function audit(action, adminUserId, payload, result, correlationId)
     }
     catch (e) {
         // log locale: non throw
-        console.error("AUDIT_FAILED", {
-            action,
-            adminUserId,
-            correlationId,
+        await reportError({
+            event: "audit_write_failed",
             message: e?.message ?? String(e),
-            code: e?.code,
+            correlationId,
+            status: 500,
+            code: e?.code ?? "AUDIT_FAILED",
+            operation: action,
+            meta: { adminUserId },
         });
     }
 }

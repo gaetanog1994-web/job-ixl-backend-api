@@ -1,5 +1,7 @@
 import { Router } from "express";
 import { pool } from "../db.js";
+import { audit } from "../audit.js";
+import { reportError } from "../observability.js";
 export const graphAdminRouter = Router();
 /**
  * POST /api/admin/graph/chains
@@ -7,8 +9,9 @@ export const graphAdminRouter = Router();
  * Output "compat": chains + optimalChains + summary.
  */
 graphAdminRouter.post("/chains", async (req, res, next) => {
+    const correlationId = req.correlationId ?? null;
+    const actorId = req.user?.id ?? "unknown";
     try {
-        const correlationId = req.correlationId ?? null;
         const access = req.accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
@@ -133,6 +136,11 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
             chainsFound: enrichedChains.length,
             maxLen: MAX_CYCLE_LEN,
         };
+        await audit("graph_chains_compute", actorId, {
+            companyId: access.currentCompanyId,
+            perimeterId: access.currentPerimeterId,
+            maxLen: MAX_CYCLE_LEN,
+        }, { ok: true, ...summary }, correlationId);
         return res.json({
             ok: true,
             summary,
@@ -143,6 +151,15 @@ graphAdminRouter.post("/chains", async (req, res, next) => {
         });
     }
     catch (e) {
+        await reportError({
+            event: "graph_chains_compute_failed",
+            message: String(e?.message ?? e),
+            correlationId,
+            status: 500,
+            code: "GRAPH_CHAINS_FAILED",
+            operation: "graph_chains_compute",
+        });
+        await audit("graph_chains_compute", actorId, {}, { ok: false, error: String(e?.message ?? e) }, correlationId);
         next(e);
     }
 });

@@ -9,9 +9,12 @@
   },
   "scripts": {
     "dev": "tsx watch src/index.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
-    "test": "NODE_OPTIONS='--import=dotenv/config' node --test"
+    "test": "npm run test:unit",
+    "test:unit": "node --import tsx --test tests/unit/**/*.test.ts",
+    "test:integration": "NODE_OPTIONS='--import=dotenv/config' node --test tests/*.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",

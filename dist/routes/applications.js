@@ -1,8 +1,9 @@
 import { Router } from "express";
 import { requireAuth, requireAdmin } from "../auth.js";
-import { supabaseAdmin } from "../db.js";
+import { supabaseAdmin, pool } from "../db.js";
 import { invalidateMapCache } from "./map.js";
 import { audit } from "../audit.js";
+import { countDistinctGroups } from "../services/countDistinctGroups.js";
 export const applicationsRouter = Router();
 async function countDistinctGroupsInPerimeter(userId, companyId, perimeterId) {
     const { data: apps, error: appsErr } = await supabaseAdmin
@@ -34,14 +35,11 @@ async function countDistinctGroupsInPerimeter(userId, companyId, perimeterId) {
         .eq("company_id", companyId);
     if (usersErr)
         throw usersErr;
-    const occupantMap = new Map((users ?? []).map((u) => [u.id, u]));
-    const groups = new Set();
-    for (const pos of positions ?? []) {
-        const u = occupantMap.get(pos.occupied_by);
-        if (u)
-            groups.add(`${u.role_id}__${u.location_id}`);
-    }
-    return groups.size;
+    return countDistinctGroups({
+        positionIds,
+        positions: (positions ?? []),
+        occupants: (users ?? []),
+    });
 }
 /**
  * POST /api/users/:userId/applications/bulk
@@ -82,6 +80,14 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         }
         if (!Number.isFinite(priority)) {
             return res.status(400).json({ error: "INVALID_BODY", message: "priority must be a number" });
+        }
+        // campaign_status check: reject new applications when campaign is closed
+        const { rows: perimeterRows } = await pool.query(`select campaign_status from perimeters where id = $1 limit 1`, [access.currentPerimeterId]);
+        if (perimeterRows[0]?.campaign_status !== "open") {
+            return res.status(403).json({
+                error: "CAMPAIGN_CLOSED",
+                message: "La campagna di mobilità non è aperta",
+            });
         }
         // max_applications da config
         const { data: config, error: configErr } = await supabaseAdmin

@@ -142,6 +142,9 @@ platformRouter.patch("/companies/:companyId", requireCompanyAdmin, async (req, r
 platformRouter.get("/companies/:companyId/perimeters", async (req, res, next) => {
     try {
         const access = req.accessContext;
+        // Explicit guard: reject if attachAccessContext didn't run (e.g. future middleware chain change).
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized" });
         const companyId = req.params.companyId;
         if (!access?.isOwner && !access?.companies.some((company) => company.company_id === companyId)) {
             return res.status(403).json({ ok: false, error: "Company access denied", correlationId: req.correlationId ?? null });

@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { requireAuth } from "../auth.js";
-import { supabaseAdmin } from "../db.js";
+import { supabaseAdmin, pool } from "../db.js";
 export const mapRouter = Router();
 const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
 const mapCache = new Map();
@@ -58,15 +58,19 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         return res.json(cached);
     }
     try {
-        // 1) app_config
-        const { data: config, error: configErr } = await supabaseAdmin
-            .from("app_config")
-            .select("max_applications")
-            .eq("company_id", access.currentCompanyId)
-            .eq("perimeter_id", access.currentPerimeterId)
-            .single();
+        // 1) app_config + campaign_status (parallel)
+        const [{ data: config, error: configErr }, perimeterRes] = await Promise.all([
+            supabaseAdmin
+                .from("app_config")
+                .select("max_applications")
+                .eq("company_id", access.currentCompanyId)
+                .eq("perimeter_id", access.currentPerimeterId)
+                .single(),
+            pool.query(`select campaign_status from perimeters where id = $1 limit 1`, [access.currentPerimeterId]),
+        ]);
         if (configErr)
             throw configErr;
+        const campaignStatus = perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
         // 2) viewer user (status + coords via locations)
         const { data: me, error: meErr } = await supabaseAdmin
             .from("users")
@@ -183,6 +187,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         id,
         full_name,
         availability_status,
+        fixed_location,
         role_id,
         roles:role_id (
           name
@@ -235,14 +240,21 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                     roles: {},
                 };
             }
+            const isFixed = !!u.fixed_location;
             if (!byLocation[loc.id].roles[roleId]) {
                 byLocation[loc.id].roles[roleId] = {
                     role_id: roleId,
                     role_name: roleName,
+                    fixed_location: isFixed,
                     applied: false,
                     priority: null,
                     users: [],
                 };
+            }
+            else {
+                // role is fixed if ANY occupant has fixed_location = true
+                if (isFixed)
+                    byLocation[loc.id].roles[roleId].fixed_location = true;
             }
             byLocation[loc.id].roles[roleId].users.push({
                 id: u.id,
@@ -272,6 +284,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             viewerUserId,
             viewerRoleId: me?.role_id ?? null,
             viewerLocationId: me?.location_id ?? null,
+            campaign_status: campaignStatus,
             myStatus: (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
                 ? "available"
                 : "inactive",

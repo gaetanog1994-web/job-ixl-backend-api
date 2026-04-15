@@ -6,6 +6,7 @@ import type { Request, Response } from "express";
 import type { AuthedRequest } from "./auth.js";
 import { requireAuth, requireAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
+import { logInfo, reportError } from "./observability.js";
 import { adminRouter } from "./routes/admin.js";
 import { graphProxyRouter } from "./routes/graphProxy.js";
 import { pool } from "./db.js";
@@ -47,7 +48,7 @@ function sendError(
 
 app.set("trust proxy", 1);
 
-console.log("✅ BOOT BACKEND VERSION: BETA5");
+logInfo("backend_boot", null, { version: "BETA5" });
 
 /**
  * CORS
@@ -68,6 +69,16 @@ const defaultDevOrigins = [
 ];
 
 const allowedOrigins = Array.from(new Set([...defaultDevOrigins, ...envAllowlist]));
+const appEnv = (process.env.APP_ENV ?? (process.env.NODE_ENV === "production" ? "production" : "development"))
+    .toLowerCase();
+const isProduction = appEnv === "production";
+const isDevelopment = appEnv === "development";
+const ENABLE_DEBUG_ENDPOINTS =
+    !isProduction &&
+    (
+        process.env.ENABLE_DEBUG_ENDPOINTS === "true" ||
+        (isDevelopment && process.env.ENABLE_DEBUG_ENDPOINTS !== "false")
+    );
 
 // CORS PRIMA delle route
 app.use(
@@ -110,8 +121,6 @@ app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
 // can intercept it and incorrectly return PERIMETER_CONTEXT_REQUIRED.
 app.use("/api/platform", requireAuth, attachAccessContext, platformRouter);
 app.use("/api/users", requireAuth, attachAccessContext, requireTenantScope, usersRouter);
-app.use("/api/map", requireAuth, attachAccessContext, requirePerimeterAccess, mapRouter);
-app.use("/api", requireAuth, attachAccessContext, requireTenantScope, applicationsRouter);
 app.use("/api/public", publicRouter);
 
 app.get("/api/config", requireAuth, attachAccessContext, requirePerimeterAccess, async (req, res, next) => {
@@ -159,15 +168,17 @@ app.get("/health", async (_req: express.Request, res: express.Response) => {
     }
 });
 
-app.get("/api/_debug/ping", (req, res) => {
-    return res.json({
-        ok: true,
-        ping: "pong",
-        correlationId: getCorrelationId(req),
+if (ENABLE_DEBUG_ENDPOINTS) {
+    app.get("/api/_debug/ping", (req, res) => {
+        return res.json({
+            ok: true,
+            ping: "pong",
+            correlationId: getCorrelationId(req),
+        });
     });
-});
+}
 
-// Rate limit solo admin
+// Rate limit — admin (60 req/min per user/IP)
 const adminLimiter = rateLimit({
     windowMs: 60_000,
     max: 60,
@@ -193,16 +204,39 @@ const adminLimiter = rateLimit({
             key: (req as any).user?.id ?? req.ip,
             statusCode: options.statusCode,
         });
-
-        return sendError(
-            res,
-            req,
-            options.statusCode,
-            "RATE_LIMITED",
-            "Too many requests"
-        );
+        return sendError(res, req, options.statusCode, "RATE_LIMITED", "Too many requests");
     },
 });
+
+// Rate limit — apply endpoint (30 req/min per IP) §2.6
+const applyLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    // Scope only to POST /api/users/:userId/applications/bulk
+    skip: (req) => {
+        if (req.method !== "POST") return true;
+        return !/^\/users\/[^/]+\/applications\/bulk$/.test(req.path);
+    },
+    keyGenerator: (req) => (req as any).user?.id ?? req.ip ?? "unknown",
+    handler: (req, res, _next, options) =>
+        sendError(res, req, options.statusCode, "RATE_LIMITED", "Too many requests"),
+});
+
+// Rate limit — map endpoint (60 req/min per user/IP) §2.6
+const mapLimiter = rateLimit({
+    windowMs: 60_000,
+    max: 60,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: (req) => (req as any).user?.id ?? req.ip ?? "unknown",
+    handler: (req, res, _next, options) =>
+        sendError(res, req, options.statusCode, "RATE_LIMITED", "Too many requests"),
+});
+
+app.use("/api/map", requireAuth, mapLimiter, attachAccessContext, requirePerimeterAccess, mapRouter);
+app.use("/api", requireAuth, applyLimiter, attachAccessContext, requireTenantScope, applicationsRouter);
 
 // Stack admin unico
 const adminApi = express.Router();
@@ -227,16 +261,16 @@ adminApi.use((req, _res, next) => {
     next();
 });
 
-// 3) graph chains server-side
+// 3) graph chains server-side (Postgres SoT path, intentionally before proxy)
 adminApi.use("/graph", graphAdminRouter);
 
-// 4) graph proxy
+// 4) graph proxy (Neo4j warmup/summary and other forwarded graph endpoints)
 adminApi.use("/graph", graphProxyRouter);
 
 // mount unico
 app.use("/api/admin", adminApi);
 
-if (process.env.NODE_ENV !== "production") {
+if (ENABLE_DEBUG_ENDPOINTS) {
     app.post("/_debug/auth-check", async (req: express.Request, res: express.Response) => {
         const authHeader = req.headers.authorization || "";
         const token = authHeader.startsWith("Bearer ")
@@ -314,17 +348,30 @@ app.use((err: any, req: any, res: any, _next: any) => {
                         ? "BAD_REQUEST"
                         : "INTERNAL_ERROR";
 
-    console.error("API_ERROR", {
-        code,
-        status,
-        message: msg,
-        correlationId: getCorrelationId(req),
-    });
+    if (status < 500) {
+        logInfo("api_handled_error", getCorrelationId(req), {
+            code,
+            status,
+            message: msg,
+            operation: `${req.method} ${req.originalUrl}`,
+        });
+    }
+
+    if (status >= 500) {
+        void reportError({
+            event: "api_unhandled_error",
+            message: msg,
+            correlationId: getCorrelationId(req),
+            status,
+            code,
+            operation: `${req.method} ${req.originalUrl}`,
+        });
+    }
 
     return sendError(res, req, status, code, msg);
 });
 
 const PORT = Number(process.env.PORT ?? 3000);
 app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Backend API up on http://localhost:${PORT}`);
+    logInfo("backend_listen", null, { url: `http://localhost:${PORT}` });
 });

@@ -4,12 +4,144 @@ import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js";
 import { graphAdminRouter } from "./graphAdmin.js";
+import { deactivateUserAndCleanup } from "../services/users.js";
+import { rebalanceApplications, type RebalanceApplicationRow } from "../services/rebalanceApplications.js";
 
 export const adminRouter = Router();
 adminRouter.use("/graph", graphAdminRouter);
 
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;
+const appEnv = (process.env.APP_ENV ?? (process.env.NODE_ENV === "production" ? "production" : "development"))
+    .toLowerCase();
+const isProduction = appEnv === "production";
+const isDevelopment = appEnv === "development";
+const ENABLE_HARNESS_ENDPOINTS =
+    !isProduction &&
+    (
+        process.env.ENABLE_HARNESS_ENDPOINTS === "true" ||
+        (isDevelopment && process.env.ENABLE_HARNESS_ENDPOINTS !== "false")
+    );
+
+/**
+ * Guard for harness-only endpoints (reset_*, initialize_test_scenario).
+ * These must not be callable in production — they destroy live data.
+ * §3.5 P1: confine harness functions to dev/staging.
+ */
+function harnessOnly(req: Request, res: Response): boolean {
+    if (!ENABLE_HARNESS_ENDPOINTS) {
+        res.status(403).json({
+            ok: false,
+            error: "HARNESS_DISABLED",
+            message:
+                "Harness endpoints are disabled for this environment. Set ENABLE_HARNESS_ENDPOINTS=true only in controlled dev/staging.",
+        });
+        return true; // caller should return immediately
+    }
+    return false;
+}
+
+/**
+ * Rebalance applications after max_applications decreases.
+ * Extracted from inline logic in POST /api/admin/config/max-applications.
+ * §3.5 P1: replaces DB trigger trg_rebalance_applications_on_max_change.
+ *
+ * Steps (in caller-provided transaction client):
+ * 1. Delete applications ranked > newMax per user (keep top-priority ones).
+ * 2. Compact remaining priorities to be sequential (1..N).
+ * 3. Recalculate application_count for ALL users in the perimeter.
+ */
+export async function rebalanceApplicationsAfterMaxChange(
+    client: import("pg").PoolClient,
+    newMax: number,
+    companyId: string,
+    perimeterId: string
+): Promise<{ deleted: number; prioritiesUpdated: number }> {
+    const applicationsRes = await client.query<RebalanceApplicationRow>(
+        `SELECT id, user_id, priority, created_at
+         FROM applications
+         WHERE company_id = $1
+           AND perimeter_id = $2`,
+        [companyId, perimeterId]
+    );
+
+    const plan = rebalanceApplications(applicationsRes.rows, newMax);
+
+    let deleted = 0;
+    if (plan.deletedIds.length > 0) {
+        const delRes = await client.query(
+            `DELETE FROM applications
+             WHERE company_id = $1
+               AND perimeter_id = $2
+               AND id = ANY($3::uuid[])`,
+            [companyId, perimeterId, plan.deletedIds]
+        );
+        deleted = delRes.rowCount ?? 0;
+    }
+
+    let prioritiesUpdated = 0;
+    if (plan.updates.length > 0) {
+        const ids = plan.updates.map((u) => u.id);
+        const priorities = plan.updates.map((u) => u.priority);
+
+        const updRes = await client.query(
+            `WITH data AS (
+                SELECT *
+                FROM unnest($1::uuid[], $2::int[]) AS t(id, priority)
+            )
+            UPDATE applications a
+            SET priority = d.priority
+            FROM data d
+            WHERE a.id = d.id
+              AND a.company_id = $3
+              AND a.perimeter_id = $4
+              AND a.priority IS DISTINCT FROM d.priority`,
+            [ids, priorities, companyId, perimeterId]
+        );
+        prioritiesUpdated = updRes.rowCount ?? 0;
+    }
+
+    // Recalculate application_count for users who still have applications
+    await client.query(
+        `UPDATE users u
+         SET    application_count = coalesce(x.cnt, 0)
+         FROM (
+             SELECT a.user_id,
+                    count(DISTINCT (uo.role_id, uo.location_id))::int AS cnt
+             FROM   applications a
+             JOIN   positions    p   ON p.id  = a.position_id
+             JOIN   users        uo  ON uo.id = p.occupied_by
+             WHERE  a.company_id   = $1
+               AND  a.perimeter_id = $2
+               AND  p.occupied_by  IS NOT NULL
+             GROUP BY a.user_id
+         ) x
+         WHERE u.id = x.user_id
+           AND u.company_id = $1
+           AND coalesce(u.perimeter_id, u.home_perimeter_id) = $2`,
+        [companyId, perimeterId]
+    );
+
+    // Zero out users who now have no applications
+    await client.query(
+        `UPDATE users
+         SET    application_count = 0
+         WHERE  company_id    = $1
+           AND  coalesce(perimeter_id, home_perimeter_id) = $2
+           AND  id NOT IN (
+               SELECT DISTINCT user_id
+               FROM   applications
+               WHERE  company_id   = $1
+                 AND  perimeter_id = $2
+           )`,
+        [companyId, perimeterId]
+    );
+
+    return {
+        deleted,
+        prioritiesUpdated,
+    };
+}
 
 if (!GRAPH_SERVICE_URL) throw new Error("Missing GRAPH_SERVICE_URL");
 if (!GRAPH_SERVICE_TOKEN) throw new Error("Missing GRAPH_SERVICE_TOKEN");
@@ -23,12 +155,21 @@ function getTenantScope(req: Request) {
     };
 }
 
+// Harness-only namespace: all /api/admin/test-scenarios/* endpoints are dev/staging only.
+adminRouter.use("/test-scenarios", (req, res, next) => {
+    if (harnessOnly(req, res)) return;
+    next();
+});
+
 /**
  * POST /api/admin/test-scenarios/:id/initialize
+ * HARNESS ONLY — dev/staging. Destructively overwrites live application data
+ * with the contents of a test scenario. Not available in production.
  */
 adminRouter.post(
     "/test-scenarios/:id/initialize",
     async (req: Request, res: Response) => {
+        if (harnessOnly(req, res)) return;
         const r = req as unknown as AuthedRequest;
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
@@ -287,6 +428,8 @@ adminRouter.get("/users/active", async (req, res, next) => {
 
 /**
  * POST /api/admin/users/:id/deactivate
+ * Uses deactivateUserAndCleanup service (replaces DB trigger).
+ * Deletes both outgoing AND incoming applications, recalculates affected counts.
  */
 adminRouter.post(
     "/users/:id/deactivate",
@@ -296,33 +439,16 @@ adminRouter.post(
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
 
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
         try {
-            const out = await withTx(async (client) => {
-                await client.query(
-                    `update users
-                     set availability_status = 'inactive', updated_by = $1
-                     where id = $2
-                       and company_id = $3
-                       and coalesce(perimeter_id, home_perimeter_id) = $4`,
-                    [r.user.id, userId, companyId, perimeterId]
-                );
-                await client.query(
-                    `delete from applications where user_id = $1 and company_id = $2 and perimeter_id = $3`,
-                    [userId, companyId, perimeterId]
-                );
-                return { deactivatedUserId: userId };
+            const out = await deactivateUserAndCleanup(userId, companyId, perimeterId, {
+                actorId: r.user.id,
             });
 
-            invalidateMapCache();
-
-            await audit(
-                "user_deactivate",
-                r.user.id,
-                { userId },
-                out,
-                correlationId
-            );
-
+            await audit("user_deactivate", r.user.id, { userId }, out, correlationId);
             return res.status(200).json({ ok: true, out, correlationId });
         } catch (e: any) {
             await audit(
@@ -346,6 +472,12 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
 
     try {
         const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({
+                error: "PERIMETER_CONTEXT_REQUIRED",
+                correlationId,
+            });
+        }
         const { maxApplications } = req.body ?? {};
         const newMax = Number(maxApplications);
 
@@ -376,66 +508,18 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
                 };
             }
 
-            const rebalanceDelete = await client.query(
-                `
-        with ranked as (
-          select
-            id,
-            user_id,
-            row_number() over (
-              partition by user_id
-              order by priority asc nulls last, created_at asc, id asc
-            ) as rn
-          from applications
-          where company_id = $2 and perimeter_id = $3
-        )
-        delete from applications a
-        using ranked r
-        where a.id = r.id
-          and r.rn > $1
-        `,
-                [newMax, companyId, perimeterId]
+            // Delegate to named function (replaces DB trigger trg_rebalance_applications_on_max_change).
+            const rebalanceResult = await rebalanceApplicationsAfterMaxChange(
+                client, newMax, companyId, perimeterId
             );
-
-            const rebalanceUpdate = await client.query(
-                `
-        with ranked as (
-          select
-            id,
-            user_id,
-            row_number() over (
-              partition by user_id
-              order by priority asc nulls last, created_at asc, id asc
-            ) as rn
-          from applications
-          where company_id = $1 and perimeter_id = $2
-        )
-        update applications a
-        set priority = r.rn
-        from ranked r
-        where a.id = r.id
-          and a.priority is distinct from r.rn
-        `,
-                [companyId, perimeterId]
-            );
-
-            await client.query(`
-        update users
-        set application_count = 0
-        where company_id = $1
-          and coalesce(perimeter_id, home_perimeter_id) = $2
-          and id not in (
-            select distinct user_id from applications where company_id = $1 and perimeter_id = $2
-          )
-      `, [companyId, perimeterId]);
 
             return {
                 oldMax,
                 newMax,
                 rebalance: {
                     performed: true,
-                    deleted: rebalanceDelete.rowCount ?? 0,
-                    prioritiesUpdated: rebalanceUpdate.rowCount ?? 0,
+                    deleted: rebalanceResult.deleted,
+                    prioritiesUpdated: rebalanceResult.prioritiesUpdated,
                 },
             };
         });
@@ -470,8 +554,11 @@ adminRouter.post("/config/max-applications", async (req: Request, res: Response)
 
 /**
  * POST /api/admin/users/reset-active
+ * HARNESS ONLY — dev/staging. Deletes ALL applications and sets all users
+ * inactive. Intended for resetting demo/test environments. Not available in production.
  */
 adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
+    if (harnessOnly(req, res)) return;
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
