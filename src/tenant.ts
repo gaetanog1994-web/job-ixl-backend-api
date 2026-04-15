@@ -1,6 +1,7 @@
 import type { NextFunction, Request, Response } from "express";
 import type { AuthedRequest } from "./auth.js";
 import { pool } from "./db.js";
+import { isOperationalPerimeterAdmin } from "./services/operationalPerimeterAdmin.js";
 
 export type CompanyRole = "super_admin";
 export type PerimeterAccessRole = "user" | "admin" | "admin_user";
@@ -339,6 +340,25 @@ export function requirePerimeterAdmin(req: Request, _res: Response, next: NextFu
     }
     if (!access.canManagePerimeter) {
         return next(httpError(403, "Perimeter admin only", "PERIMETER_ADMIN_ONLY"));
+    }
+    return next();
+}
+
+/**
+ * Strict operational guard for perimeter actions.
+ * Allows ONLY direct active perimeter memberships with access_role admin/admin_user.
+ * Owner or super-admin role alone must NOT bypass this guard.
+ */
+export function requireOperationalPerimeterAdmin(req: Request, _res: Response, next: NextFunction) {
+    const access = (req as AuthedRequest).accessContext;
+    if (!access?.currentCompanyId) {
+        return next(httpError(400, "Company context required", "COMPANY_CONTEXT_REQUIRED"));
+    }
+    if (!access?.currentPerimeterId) {
+        return next(httpError(400, "Perimeter context required", "PERIMETER_CONTEXT_REQUIRED"));
+    }
+    if (!isOperationalPerimeterAdmin(access)) {
+        return next(httpError(403, "Operational perimeter admin only", "OPERATIONAL_PERIMETER_ADMIN_ONLY"));
     }
     return next();
 }

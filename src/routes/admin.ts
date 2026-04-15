@@ -6,6 +6,7 @@ import { invalidateMapCache } from "./map.js";
 import { graphAdminRouter } from "./graphAdmin.js";
 import { deactivateUserAndCleanup } from "../services/users.js";
 import { rebalanceApplications, type RebalanceApplicationRow } from "../services/rebalanceApplications.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 
 export const adminRouter = Router();
 adminRouter.use("/graph", graphAdminRouter);
@@ -606,7 +607,7 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
 /**
  * GET /api/admin/campaign-status
  */
-adminRouter.get("/campaign-status", async (req: Request, res: Response) => {
+adminRouter.get("/campaign-status", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     try {
         const { perimeterId } = getTenantScope(req);
         const correlationId = (req as any).correlationId;
@@ -630,7 +631,7 @@ adminRouter.get("/campaign-status", async (req: Request, res: Response) => {
  * PATCH /api/admin/campaign-status
  * Body: { campaign_status: 'open' | 'closed' }
  */
-adminRouter.patch("/campaign-status", async (req: Request, res: Response) => {
+adminRouter.patch("/campaign-status", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
     try {
