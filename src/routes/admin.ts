@@ -161,6 +161,7 @@ adminRouter.use("/test-scenarios", (req, res, next) => {
     if (harnessOnly(req, res)) return;
     next();
 });
+adminRouter.use("/test-scenarios", requireOperationalPerimeterAdmin);
 
 /**
  * POST /api/admin/test-scenarios/:id/initialize
@@ -394,7 +395,7 @@ adminRouter.post("/users/invite", async (req: Request, res: Response) => {
 /**
  * GET /api/admin/users/active
  */
-adminRouter.get("/users/active", async (req, res, next) => {
+adminRouter.get("/users/active", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
@@ -658,7 +659,7 @@ adminRouter.patch("/campaign-status", requireOperationalPerimeterAdmin, async (r
     }
 });
 
-adminRouter.get("/candidatures", async (req, res, next) => {
+adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
@@ -708,7 +709,7 @@ adminRouter.get("/candidatures", async (req, res, next) => {
     }
 });
 
-adminRouter.get("/users", async (req, res, next) => {
+adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(
@@ -1293,7 +1294,7 @@ adminRouter.post("/test-scenarios/:id/applications", async (req: Request, res: R
 /**
  * GET /api/admin/interlocking-scenarios
  */
-adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, next) => {
+adminRouter.get("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
@@ -1337,7 +1338,7 @@ adminRouter.get("/interlocking-scenarios", async (req: Request, res: Response, n
     }
 });
 
-adminRouter.get("/interlocking-scenarios/export.csv", async (req: Request, res: Response, next) => {
+adminRouter.get("/interlocking-scenarios/export.csv", requireOperationalPerimeterAdmin, async (req: Request, res: Response, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
@@ -1408,7 +1409,7 @@ adminRouter.get("/interlocking-scenarios/export.csv", async (req: Request, res: 
 /**
  * POST /api/admin/interlocking-scenarios
  */
-adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) => {
+adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 
@@ -1537,7 +1538,7 @@ adminRouter.post("/interlocking-scenarios", async (req: Request, res: Response) 
  * DELETE /api/admin/interlocking-scenarios
  * body: { ids: string[] }
  */
-adminRouter.delete("/interlocking-scenarios", async (req: Request, res: Response) => {
+adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
 

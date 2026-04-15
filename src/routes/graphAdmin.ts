@@ -3,8 +3,10 @@ import { pool } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { reportError } from "../observability.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 
 export const graphAdminRouter = Router();
+graphAdminRouter.use(requireOperationalPerimeterAdmin);
 
 /**
  * POST /api/admin/graph/chains

@@ -3,8 +3,10 @@ import type { Request, Response, NextFunction } from "express";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { classifyGraphFailure, reportError } from "../observability.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 
 export const graphProxyRouter = Router();
+graphProxyRouter.use(requireOperationalPerimeterAdmin);
 
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;

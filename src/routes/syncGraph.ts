@@ -4,6 +4,7 @@ import type { Request, Response, NextFunction } from "express";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { classifyGraphFailure, reportError } from "../observability.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -20,6 +21,7 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 });
 
 export const syncGraphRouter = Router();
+syncGraphRouter.use(requireOperationalPerimeterAdmin);
 
 /**
  * POST /api/admin/sync-graph
