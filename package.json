@@ -10,25 +10,33 @@
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
+    "openapi:generate": "node --import tsx scripts/generate-openapi.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "test": "npm run test:unit",
     "test:unit": "node --import tsx --test tests/unit/**/*.test.ts",
-    "test:integration": "NODE_OPTIONS='--import=dotenv/config' node --test tests/*.test.js"
+    "test:integration": "ENABLE_TEST_AUTH_BYPASS=true ENABLE_TEST_DB_BYPASS=true GRAPH_SERVICE_URL=http://127.0.0.1:5999 GRAPH_SERVICE_TOKEN=test-graph-token node --import tsx --test tests/integration/**/*.test.ts",
+    "test:integration:legacy": "NODE_OPTIONS='--import=dotenv/config' node --test tests/*.test.js"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/swagger-ui-express": "^4.1.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "express-rate-limit": "^7.4.1",
-    "pg": "^8.12.0"
+    "js-yaml": "^4.1.1",
+    "pg": "^8.12.0",
+    "swagger-jsdoc": "^6.2.8",
+    "swagger-ui-express": "^5.0.1"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^4.17.25",
     "@types/node": "^20.19.27",
     "@types/pg": "^8.16.0",
+    "@types/swagger-jsdoc": "^6.0.4",
     "tsx": "^4.19.1",
     "typescript": "^5.5.4"
   }

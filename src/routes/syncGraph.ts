@@ -130,6 +130,8 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
                 body: JSON.stringify({
                     companyId: access.currentCompanyId,
                     perimeterId: access.currentPerimeterId,
+                    company_id: access.currentCompanyId,
+                    perimeter_id: access.currentPerimeterId,
                 }),
             });
         } catch {
@@ -148,6 +150,8 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
                 usersById,
                 companyId: access.currentCompanyId,
                 perimeterId: access.currentPerimeterId,
+                company_id: access.currentCompanyId,
+                perimeter_id: access.currentPerimeterId,
             }),
         });
 

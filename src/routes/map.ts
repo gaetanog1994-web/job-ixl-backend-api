@@ -8,6 +8,7 @@ type CacheEntry = { expiresAt: number; value: any };
 
 const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
 const mapCache = new Map<string, CacheEntry>();
+let invalidateMapCacheCalls = 0;
 
 function cacheKey(params: { tokenUserId: string; viewerUserId: string; mode: string; companyId: string; perimeterId: string }) {
     // include tokenUserId to avoid accidental cross-user leakage when viewerUserId omitted
@@ -29,7 +30,16 @@ function cacheSet(key: string, value: any) {
 }
 
 export function invalidateMapCache() {
+    invalidateMapCacheCalls += 1;
     mapCache.clear();
+}
+
+export function __getInvalidateMapCacheCallsForTests() {
+    return invalidateMapCacheCalls;
+}
+
+export function __resetInvalidateMapCacheCallsForTests() {
+    invalidateMapCacheCalls = 0;
 }
 
 /**

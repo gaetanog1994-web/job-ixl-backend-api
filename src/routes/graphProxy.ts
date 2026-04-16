@@ -60,10 +60,14 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
                 ...sourceBody,
                 companyId: access.currentCompanyId,
                 perimeterId: access.currentPerimeterId,
+                company_id: access.currentCompanyId,
+                perimeter_id: access.currentPerimeterId,
             });
         } else {
             targetUrl.searchParams.set("companyId", access.currentCompanyId);
             targetUrl.searchParams.set("perimeterId", access.currentPerimeterId);
+            targetUrl.searchParams.set("company_id", access.currentCompanyId);
+            targetUrl.searchParams.set("perimeter_id", access.currentPerimeterId);
         }
 
         async function doFetch(url: URL) {
