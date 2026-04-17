@@ -125,6 +125,8 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
                 method: "POST",
                 headers: {
                     "x-graph-token": GRAPH_SERVICE_TOKEN,
+                    "x-company-id": access.currentCompanyId,
+                    "x-perimeter-id": access.currentPerimeterId,
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
@@ -144,6 +146,8 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
             headers: {
                 "Content-Type": "application/json",
                 "x-graph-token": GRAPH_SERVICE_TOKEN,
+                "x-company-id": access.currentCompanyId,
+                "x-perimeter-id": access.currentPerimeterId,
             },
             body: JSON.stringify({
                 applications: edges,

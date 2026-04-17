@@ -474,7 +474,7 @@
  * /api/admin/graph/chains:
  *   post:
  *     tags: [Admin Graph]
- *     summary: Compute chains from Postgres graph representation
+ *     summary: Compute chains through Neo4j graph proxy (tenant-scoped)
  *     security: [{ bearerAuth: [] }]
  *     responses:
  *       200: { description: Chains computed }

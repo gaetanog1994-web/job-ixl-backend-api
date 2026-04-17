@@ -2,6 +2,7 @@ import "dotenv/config";
 import express from "express";
 import cors from "cors";
 import rateLimit from "express-rate-limit";
+import swaggerUi from "swagger-ui-express";
 import { requireAuth, requireAdmin } from "./auth.js";
 import { correlation } from "./audit.js";
 import { logInfo, reportError } from "./observability.js";
@@ -13,12 +14,23 @@ import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
 import { publicRouter } from "./routes/public.js";
-import { graphAdminRouter } from "./routes/graphAdmin.js";
 import { platformRouter } from "./routes/platform.js";
 import { attachAccessContext, requirePerimeterAccess, requireTenantScope, } from "./tenant.js";
+import { buildOpenApiSpec } from "./openapi.js";
 const app = express();
 function getCorrelationId(req) {
     return req?.correlationId ?? null;
+}
+function asOptionalString(value, max = 2000) {
+    if (typeof value !== "string")
+        return null;
+    const trimmed = value.trim();
+    if (!trimmed)
+        return null;
+    return trimmed.slice(0, max);
+}
+function asOptionalNumber(value) {
+    return Number.isFinite(value) ? Number(value) : null;
 }
 function sendError(res, req, status, code, message, extra) {
     const correlationId = getCorrelationId(req);
@@ -54,6 +66,7 @@ const isDevelopment = appEnv === "development";
 const ENABLE_DEBUG_ENDPOINTS = !isProduction &&
     (process.env.ENABLE_DEBUG_ENDPOINTS === "true" ||
         (isDevelopment && process.env.ENABLE_DEBUG_ENDPOINTS !== "false"));
+const openApiSpec = buildOpenApiSpec();
 // CORS PRIMA delle route
 app.use(cors({
     origin: (origin, cb) => {
@@ -79,6 +92,45 @@ app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
         isOwner: r.accessContext?.isOwner === true,
         isSuperAdmin: r.accessContext?.isCompanySuperAdmin === true,
         access: r.accessContext ?? null,
+    });
+});
+app.post("/api/errors", requireAuth, async (req, res) => {
+    const correlationId = getCorrelationId(req);
+    const body = (req.body ?? {});
+    const message = asOptionalString(body.message, 1000) ?? "frontend error";
+    const frontendEventType = asOptionalString(body.kind, 64) ?? "unknown";
+    const stack = asOptionalString(body.stack, 4000);
+    const source = asOptionalString(body.source, 512);
+    const reason = asOptionalString(body.reason, 2000);
+    const url = asOptionalString(body.url, 1024);
+    const userAgent = asOptionalString(body.userAgent, 512);
+    const timestamp = asOptionalString(body.timestamp, 64);
+    const line = asOptionalNumber(body.line);
+    const column = asOptionalNumber(body.column);
+    const userId = req.user?.id ?? null;
+    await reportError({
+        event: "frontend_error",
+        message,
+        correlationId,
+        status: 500,
+        code: "FRONTEND_ERROR",
+        operation: "POST /api/errors",
+        meta: {
+            frontendEventType,
+            stack,
+            source,
+            reason,
+            url,
+            line,
+            column,
+            userAgent,
+            timestamp,
+            userId,
+        },
+    });
+    return res.status(202).json({
+        ok: true,
+        correlationId,
     });
 });
 // ✅ DOPO CORS
@@ -133,6 +185,10 @@ if (ENABLE_DEBUG_ENDPOINTS) {
             correlationId: getCorrelationId(req),
         });
     });
+    app.get("/api/docs/openapi.json", (_req, res) => {
+        return res.json(openApiSpec);
+    });
+    app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openApiSpec));
 }
 // Rate limit — admin (60 req/min per user/IP)
 const adminLimiter = rateLimit({
@@ -208,9 +264,7 @@ adminApi.use((req, _res, next) => {
     });
     next();
 });
-// 3) graph chains server-side
-adminApi.use("/graph", graphAdminRouter);
-// 4) graph proxy
+// 3) graph proxy (Neo4j warmup/chains/summary and other forwarded graph endpoints)
 adminApi.use("/graph", graphProxyRouter);
 // mount unico
 app.use("/api/admin", adminApi);

@@ -2,6 +2,7 @@ import { Router } from "express";
 import { pool, supabaseAdmin, withTx } from "../db.js";
 import { requireCompanyAdmin, requireOwner } from "../tenant.js";
 import { audit } from "../audit.js";
+import { getOrInviteUserByEmail, normalizeEmailInput } from "../services/authUsers.js";
 export const platformRouter = Router();
 function splitName(firstName, lastName) {
     return `${firstName.trim()} ${lastName.trim()}`.replace(/\s+/g, " ").trim();
@@ -9,6 +10,8 @@ function splitName(firstName, lastName) {
 platformRouter.get("/companies", async (req, res, next) => {
     try {
         const access = req.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId: req.correlationId ?? null });
         if (access?.isOwner) {
             const { rows } = await pool.query(`
                 select
@@ -41,10 +44,12 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
     const r = req;
     const correlationId = req.correlationId ?? null;
     try {
+        if (!r.accessContext)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const name = String(req.body?.name ?? "").trim();
         const firstName = String(req.body?.first_super_admin?.first_name ?? "").trim();
         const lastName = String(req.body?.first_super_admin?.last_name ?? "").trim();
-        const email = String(req.body?.first_super_admin?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.first_super_admin?.email);
         if (!name || !firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing company or super admin data", correlationId });
         }
@@ -56,18 +61,15 @@ platformRouter.post("/companies", requireOwner, async (req, res, next) => {
                 values ($1, $2, 'active', $3)
                 returning id, name, slug, status, created_at
                 `, [name, slug || `company-${Date.now()}`, r.user.id]);
-            const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-                data: {
+            const { userId: invitedUserId } = await getOrInviteUserByEmail({
+                authAdmin: supabaseAdmin.auth.admin,
+                email,
+                metadata: {
                     first_name: firstName,
                     last_name: lastName,
                     full_name: fullName,
                 },
             });
-            if (error)
-                throw new Error(error.message);
-            const invitedUserId = data.user?.id;
-            if (!invitedUserId)
-                throw new Error("Invite returned no user id");
             const companyId = companyInsert.rows[0].id;
             await client.query(`
                 insert into users (
@@ -111,15 +113,18 @@ platformRouter.patch("/companies/:companyId", requireCompanyAdmin, async (req, r
     const correlationId = req.correlationId ?? null;
     try {
         const access = r.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
         const name = String(req.body?.name ?? "").trim();
         if (!name) {
             return res.status(400).json({ ok: false, error: "missing company name", correlationId });
         }
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
             return res.status(403).json({
                 ok: false,
                 error: "Company scope mismatch",
+                code: "TENANT_SCOPE_MISMATCH",
                 correlationId,
             });
         }
@@ -173,6 +178,9 @@ platformRouter.get("/companies/:companyId/perimeters", async (req, res, next) =>
 });
 platformRouter.get("/companies/:companyId/super-admins", requireOwner, async (req, res, next) => {
     try {
+        const access = req.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId: req.correlationId ?? null });
         const companyId = req.params.companyId;
         const { rows } = await pool.query(`
             select
@@ -198,26 +206,33 @@ platformRouter.post("/companies/:companyId/super-admins", requireOwner, async (r
     const r = req;
     const correlationId = req.correlationId ?? null;
     try {
+        if (!r.accessContext)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
+        if (r.accessContext.currentCompanyId && r.accessContext.currentCompanyId !== companyId) {
+            return res.status(403).json({
+                ok: false,
+                error: "Company scope mismatch",
+                code: "TENANT_SCOPE_MISMATCH",
+                correlationId,
+            });
+        }
         const firstName = String(req.body?.first_name ?? "").trim();
         const lastName = String(req.body?.last_name ?? "").trim();
-        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.email);
         const fullName = splitName(firstName, lastName);
         if (!firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing super admin data", correlationId });
         }
-        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-            data: {
+        const { userId: invitedUserId } = await getOrInviteUserByEmail({
+            authAdmin: supabaseAdmin.auth.admin,
+            email,
+            metadata: {
                 first_name: firstName,
                 last_name: lastName,
                 full_name: fullName,
             },
         });
-        if (error)
-            throw new Error(error.message);
-        const invitedUserId = data.user?.id;
-        if (!invitedUserId)
-            throw new Error("Invite returned no user id");
         await withTx(async (client) => {
             await client.query(`
                 insert into users (
@@ -261,6 +276,8 @@ platformRouter.delete("/companies/:companyId/super-admins/:userId", requireOwner
     const r = req;
     const correlationId = req.correlationId ?? null;
     try {
+        if (!r.accessContext)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
         const userId = req.params.userId;
         await pool.query(`
@@ -282,11 +299,14 @@ platformRouter.post("/companies/:companyId/perimeters", requireCompanyAdmin, asy
     const correlationId = req.correlationId ?? null;
     try {
         const access = r.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
             return res.status(403).json({
                 ok: false,
                 error: "Company scope mismatch",
+                code: "TENANT_SCOPE_MISMATCH",
                 correlationId,
             });
         }
@@ -313,14 +333,16 @@ platformRouter.patch("/companies/:companyId/perimeters/:perimeterId", requireCom
     const correlationId = req.correlationId ?? null;
     try {
         const access = r.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
         const perimeterId = req.params.perimeterId;
         const name = String(req.body?.name ?? "").trim();
         if (!name) {
             return res.status(400).json({ ok: false, error: "missing perimeter name", correlationId });
         }
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
-            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", code: "TENANT_SCOPE_MISMATCH", correlationId });
         }
         const { rows } = await pool.query(`
             update perimeters
@@ -342,10 +364,12 @@ platformRouter.patch("/companies/:companyId/perimeters/:perimeterId", requireCom
 platformRouter.get("/companies/:companyId/perimeters/:perimeterId/admins", requireCompanyAdmin, async (req, res, next) => {
     try {
         const access = req.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId: req.correlationId ?? null });
         const companyId = req.params.companyId;
         const perimeterId = req.params.perimeterId;
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
-            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId: req.correlationId ?? null });
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", code: "TENANT_SCOPE_MISMATCH", correlationId: req.correlationId ?? null });
         }
         const { rows } = await pool.query(`
             select
@@ -373,30 +397,29 @@ platformRouter.post("/companies/:companyId/perimeters/:perimeterId/admins", requ
     const correlationId = req.correlationId ?? null;
     try {
         const access = r.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
         const perimeterId = req.params.perimeterId;
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
-            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", code: "TENANT_SCOPE_MISMATCH", correlationId });
         }
         const firstName = String(req.body?.first_name ?? "").trim();
         const lastName = String(req.body?.last_name ?? "").trim();
-        const email = String(req.body?.email ?? "").trim().toLowerCase();
+        const email = normalizeEmailInput(req.body?.email);
         const fullName = splitName(firstName, lastName);
         if (!firstName || !lastName || !email) {
             return res.status(400).json({ ok: false, error: "missing admin data", correlationId });
         }
-        const { data, error } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
-            data: {
+        const { userId: invitedUserId } = await getOrInviteUserByEmail({
+            authAdmin: supabaseAdmin.auth.admin,
+            email,
+            metadata: {
                 first_name: firstName,
                 last_name: lastName,
                 full_name: fullName,
             },
         });
-        if (error)
-            throw new Error(error.message);
-        const invitedUserId = data.user?.id;
-        if (!invitedUserId)
-            throw new Error("Invite returned no user id");
         await withTx(async (client) => {
             await client.query(`
                 insert into users (
@@ -444,11 +467,13 @@ platformRouter.delete("/companies/:companyId/perimeters/:perimeterId/admins/:use
     const correlationId = req.correlationId ?? null;
     try {
         const access = r.accessContext;
+        if (!access)
+            return res.status(401).json({ ok: false, error: "Unauthorized", correlationId });
         const companyId = req.params.companyId;
         const perimeterId = req.params.perimeterId;
         const userId = req.params.userId;
-        if (!access?.isOwner && access?.currentCompanyId !== companyId) {
-            return res.status(403).json({ ok: false, error: "Company scope mismatch", correlationId });
+        if (!access.isOwner && access.currentCompanyId !== companyId) {
+            return res.status(403).json({ ok: false, error: "Company scope mismatch", code: "TENANT_SCOPE_MISMATCH", correlationId });
         }
         await pool.query(`
             update perimeter_memberships

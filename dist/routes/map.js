@@ -4,6 +4,7 @@ import { supabaseAdmin, pool } from "../db.js";
 export const mapRouter = Router();
 const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
 const mapCache = new Map();
+let invalidateMapCacheCalls = 0;
 function cacheKey(params) {
     // include tokenUserId to avoid accidental cross-user leakage when viewerUserId omitted
     return `map:v2:${params.tokenUserId}:${params.viewerUserId}:${params.companyId}:${params.perimeterId}:${params.mode}`;
@@ -22,7 +23,14 @@ function cacheSet(key, value) {
     mapCache.set(key, { value, expiresAt: Date.now() + MAP_CACHE_TTL_MS });
 }
 export function invalidateMapCache() {
+    invalidateMapCacheCalls += 1;
     mapCache.clear();
+}
+export function __getInvalidateMapCacheCallsForTests() {
+    return invalidateMapCacheCalls;
+}
+export function __resetInvalidateMapCacheCallsForTests() {
+    invalidateMapCacheCalls = 0;
 }
 /**
  * GET /api/map/positions

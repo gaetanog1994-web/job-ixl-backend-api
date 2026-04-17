@@ -1,7 +1,9 @@
 import { Router } from "express";
 import { audit } from "../audit.js";
 import { classifyGraphFailure, reportError } from "../observability.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 export const graphProxyRouter = Router();
+graphProxyRouter.use(requireOperationalPerimeterAdmin);
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN;
 if (!GRAPH_SERVICE_URL)
@@ -49,11 +51,15 @@ graphProxyRouter.use(async (req, res) => {
                 ...sourceBody,
                 companyId: access.currentCompanyId,
                 perimeterId: access.currentPerimeterId,
+                company_id: access.currentCompanyId,
+                perimeter_id: access.currentPerimeterId,
             });
         }
         else {
             targetUrl.searchParams.set("companyId", access.currentCompanyId);
             targetUrl.searchParams.set("perimeterId", access.currentPerimeterId);
+            targetUrl.searchParams.set("company_id", access.currentCompanyId);
+            targetUrl.searchParams.set("perimeter_id", access.currentPerimeterId);
         }
         async function doFetch(url) {
             return fetch(url.toString(), { method, headers, body });

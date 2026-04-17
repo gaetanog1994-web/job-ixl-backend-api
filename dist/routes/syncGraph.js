@@ -2,6 +2,7 @@ import { Router } from "express";
 import { createClient } from "@supabase/supabase-js";
 import { audit } from "../audit.js";
 import { classifyGraphFailure, reportError } from "../observability.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL;
@@ -18,6 +19,7 @@ const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: { persistSession: false, autoRefreshToken: false },
 });
 export const syncGraphRouter = Router();
+syncGraphRouter.use(requireOperationalPerimeterAdmin);
 /**
  * POST /api/admin/sync-graph
  * Prodotto-oriented: rebuild completo on-demand del grafo Neo4j.
@@ -109,11 +111,15 @@ syncGraphRouter.post("/", async (req, res) => {
                 method: "POST",
                 headers: {
                     "x-graph-token": GRAPH_SERVICE_TOKEN,
+                    "x-company-id": access.currentCompanyId,
+                    "x-perimeter-id": access.currentPerimeterId,
                     "Content-Type": "application/json",
                 },
                 body: JSON.stringify({
                     companyId: access.currentCompanyId,
                     perimeterId: access.currentPerimeterId,
+                    company_id: access.currentCompanyId,
+                    perimeter_id: access.currentPerimeterId,
                 }),
             });
         }
@@ -125,12 +131,16 @@ syncGraphRouter.post("/", async (req, res) => {
             headers: {
                 "Content-Type": "application/json",
                 "x-graph-token": GRAPH_SERVICE_TOKEN,
+                "x-company-id": access.currentCompanyId,
+                "x-perimeter-id": access.currentPerimeterId,
             },
             body: JSON.stringify({
                 applications: edges,
                 usersById,
                 companyId: access.currentCompanyId,
                 perimeterId: access.currentPerimeterId,
+                company_id: access.currentCompanyId,
+                perimeter_id: access.currentPerimeterId,
             }),
         });
         const buildJson = await buildRes.json().catch(() => null);

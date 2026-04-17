@@ -2,11 +2,10 @@ import { Router } from "express";
 import { withTx, pool, supabaseAdmin } from "../db.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js";
-import { graphAdminRouter } from "./graphAdmin.js";
 import { deactivateUserAndCleanup } from "../services/users.js";
 import { rebalanceApplications } from "../services/rebalanceApplications.js";
+import { requireOperationalPerimeterAdmin } from "../tenant.js";
 export const adminRouter = Router();
-adminRouter.use("/graph", graphAdminRouter);
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN;
 const appEnv = (process.env.APP_ENV ?? (process.env.NODE_ENV === "production" ? "production" : "development"))
@@ -118,12 +117,267 @@ function getTenantScope(req) {
         perimeterId: access?.currentPerimeterId ?? null,
     };
 }
+async function getTableColumns(client, tableName) {
+    const { rows } = await client.query(`
+        select column_name
+        from information_schema.columns
+        where table_schema = 'public'
+          and table_name = $1
+        `, [tableName]);
+    return new Set(rows.map((r) => r.column_name));
+}
+async function deleteScopedAuditRows(client, tableName, companyId, perimeterId) {
+    const columns = await getTableColumns(client, tableName);
+    if (columns.size === 0) {
+        return { deleted: 0, strategy: "table_missing" };
+    }
+    if (columns.has("company_id") && columns.has("perimeter_id")) {
+        const out = await client.query(`delete from ${tableName}
+             where company_id = $1
+               and perimeter_id = $2`, [companyId, perimeterId]);
+        return { deleted: out.rowCount ?? 0, strategy: "scope_columns" };
+    }
+    if (columns.has("payload_json")) {
+        const out = await client.query(`delete from ${tableName}
+             where (
+                (payload_json->>'company_id' = $1 or payload_json->>'companyId' = $1)
+                and
+                (payload_json->>'perimeter_id' = $2 or payload_json->>'perimeterId' = $2)
+             )`, [companyId, perimeterId]);
+        return { deleted: out.rowCount ?? 0, strategy: "payload_json" };
+    }
+    return { deleted: 0, strategy: "unsupported" };
+}
+async function deleteUserSkillsRows(client, userId, companyId, perimeterId) {
+    const columns = await getTableColumns(client, "user_skills");
+    if (columns.size === 0)
+        return { deleted: 0, strategy: "table_missing" };
+    if (!columns.has("user_id"))
+        return { deleted: 0, strategy: "unsupported" };
+    if (columns.has("company_id") && columns.has("perimeter_id")) {
+        const out = await client.query(`delete from user_skills
+             where user_id = $1
+               and company_id = $2
+               and perimeter_id = $3`, [userId, companyId, perimeterId]);
+        return { deleted: out.rowCount ?? 0, strategy: "scoped" };
+    }
+    const out = await client.query(`delete from user_skills
+         where user_id = $1`, [userId]);
+    return { deleted: out.rowCount ?? 0, strategy: "user_only" };
+}
+/**
+ * DELETE /api/admin/gdpr/tenant
+ * Requires:
+ * - global admin auth (mounted in /api/admin stack)
+ * - operational perimeter admin membership (route-level)
+ *
+ * Deletes tenant-scoped data for current company/perimeter:
+ * - applications
+ * - interlocking_scenarios
+ * - audit_log/admin_audit_log (when scope can be resolved)
+ * - sets all perimeter users to availability_status='inactive'
+ *
+ * Does NOT delete auth.users identities (manual Supabase admin operation).
+ */
+adminRouter.delete("/gdpr/tenant", requireOperationalPerimeterAdmin, async (req, res) => {
+    const r = req;
+    const correlationId = req.correlationId;
+    const { companyId, perimeterId } = getTenantScope(req);
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+    // Explicit pre-audit requested by sprint: log intent before destructive execution.
+    await audit("gdpr_tenant_delete_requested", r.user.id, {
+        companyId,
+        perimeterId,
+        note: "Deletes applications, interlocking_scenarios, tenant-scoped audit rows, and deactivates users. Does not delete auth.users.",
+    }, { started: true }, correlationId);
+    try {
+        const out = await withTx(async (client) => {
+            const applicationsDelete = await client.query(`delete from applications
+                 where company_id = $1
+                   and perimeter_id = $2`, [companyId, perimeterId]);
+            const scenariosDelete = await client.query(`delete from interlocking_scenarios
+                 where company_id = $1
+                   and perimeter_id = $2`, [companyId, perimeterId]);
+            const auditDelete = await deleteScopedAuditRows(client, "audit_log", companyId, perimeterId);
+            const adminAuditDelete = await deleteScopedAuditRows(client, "admin_audit_log", companyId, perimeterId);
+            const usersDeactivate = await client.query(`update users
+                 set availability_status = 'inactive',
+                     application_count = 0
+                 where company_id = $1
+                   and coalesce(perimeter_id, home_perimeter_id) = $2`, [companyId, perimeterId]);
+            return {
+                companyId,
+                perimeterId,
+                deleted: {
+                    applications: applicationsDelete.rowCount ?? 0,
+                    interlocking_scenarios: scenariosDelete.rowCount ?? 0,
+                    audit_log: auditDelete,
+                    admin_audit_log: adminAuditDelete,
+                },
+                usersUpdated: {
+                    setInactive: usersDeactivate.rowCount ?? 0,
+                },
+            };
+        });
+        invalidateMapCache();
+        await audit("gdpr_tenant_delete_completed", r.user.id, { correlationId }, out, correlationId);
+        return res.status(200).json({
+            ok: true,
+            out,
+            gdprScope: {
+                deleted: [
+                    "applications (current perimeter)",
+                    "interlocking_scenarios (current perimeter)",
+                    "audit_log/admin_audit_log rows resolvable to current perimeter",
+                ],
+                notDeleted: [
+                    "supabase auth.users identities (must be removed manually via Supabase admin/dashboard)",
+                ],
+            },
+            correlationId,
+        });
+    }
+    catch (e) {
+        await audit("gdpr_tenant_delete_failed", r.user.id, { companyId, perimeterId }, { error: String(e?.message ?? e) }, correlationId);
+        return res.status(500).json({
+            ok: false,
+            error: "GDPR tenant delete failed",
+            detail: String(e?.message ?? e),
+            correlationId,
+        });
+    }
+});
+/**
+ * GET /api/admin/gdpr/tenant/export
+ * Requires global admin auth (stack-level).
+ * Returns tenant-scoped JSON export as downloadable attachment.
+ */
+adminRouter.get("/gdpr/tenant/export", async (req, res) => {
+    const r = req;
+    const correlationId = req.correlationId;
+    const { companyId, perimeterId } = getTenantScope(req);
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+    try {
+        const [usersRes, appsRes, scenariosRes] = await Promise.all([
+            pool.query(`select *
+                 from users
+                 where company_id = $1
+                   and coalesce(perimeter_id, home_perimeter_id) = $2
+                 order by created_at asc nulls last, id`, [companyId, perimeterId]),
+            pool.query(`select *
+                 from applications
+                 where company_id = $1
+                   and perimeter_id = $2
+                 order by created_at asc nulls last, id`, [companyId, perimeterId]),
+            pool.query(`select *
+                 from interlocking_scenarios
+                 where company_id = $1
+                   and perimeter_id = $2
+                 order by generated_at desc nulls last, created_at desc nulls last, id`, [companyId, perimeterId]),
+        ]);
+        const today = new Date().toISOString().slice(0, 10);
+        const filename = `jip-export-${perimeterId}-${today}.json`;
+        const payload = {
+            exportedAt: new Date().toISOString(),
+            companyId,
+            perimeterId,
+            users: usersRes.rows,
+            applications: appsRes.rows,
+            interlocking_scenarios: scenariosRes.rows,
+        };
+        await audit("gdpr_tenant_export", r.user.id, { companyId, perimeterId }, {
+            users: usersRes.rowCount ?? usersRes.rows.length,
+            applications: appsRes.rowCount ?? appsRes.rows.length,
+            scenarios: scenariosRes.rowCount ?? scenariosRes.rows.length,
+        }, correlationId);
+        res.setHeader("Content-Type", "application/json; charset=utf-8");
+        res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
+        return res.status(200).send(JSON.stringify(payload, null, 2));
+    }
+    catch (e) {
+        await audit("gdpr_tenant_export_failed", r.user.id, { companyId, perimeterId }, { error: String(e?.message ?? e) }, correlationId);
+        return res.status(500).json({
+            ok: false,
+            error: "GDPR tenant export failed",
+            detail: String(e?.message ?? e),
+            correlationId,
+        });
+    }
+});
+/**
+ * DELETE /api/admin/gdpr/users/:userId
+ * Requires global admin auth (stack-level).
+ * Deactivates and anonymizes the user while preserving row/FK integrity.
+ */
+adminRouter.delete("/gdpr/users/:userId", async (req, res) => {
+    const r = req;
+    const correlationId = req.correlationId;
+    const { companyId, perimeterId } = getTenantScope(req);
+    const userId = String(req.params.userId ?? "").trim();
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+    if (!userId) {
+        return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED", correlationId });
+    }
+    try {
+        const cleanupOut = await deactivateUserAndCleanup(userId, companyId, perimeterId, {
+            actorId: r.user.id,
+            setShowPositionFalse: true,
+        });
+        const out = await withTx(async (client) => {
+            const userSkillsDelete = await deleteUserSkillsRows(client, userId, companyId, perimeterId);
+            const userUpdate = await client.query(`update users
+                 set availability_status = 'inactive',
+                     show_position = false,
+                     full_name = 'Utente rimosso',
+                     email = 'removed@removed.invalid',
+                     application_count = 0,
+                     updated_by = $4
+                 where id = $1
+                   and company_id = $2
+                   and coalesce(perimeter_id, home_perimeter_id) = $3`, [userId, companyId, perimeterId, r.user.id]);
+            if ((userUpdate.rowCount ?? 0) === 0) {
+                throw new Error("USER_NOT_FOUND_IN_SCOPE");
+            }
+            return {
+                cleanup: cleanupOut,
+                user_skills: userSkillsDelete,
+                usersAnonymized: userUpdate.rowCount ?? 0,
+            };
+        });
+        invalidateMapCache();
+        await audit("gdpr_user_delete_anonymize", r.user.id, { userId, companyId, perimeterId }, out, correlationId);
+        return res.status(200).json({
+            ok: true,
+            out,
+            note: "User row preserved for FK integrity. auth.users identity is not deleted by this endpoint.",
+            correlationId,
+        });
+    }
+    catch (e) {
+        const message = String(e?.message ?? e);
+        const status = message === "USER_NOT_FOUND_IN_SCOPE" ? 404 : 500;
+        await audit("gdpr_user_delete_anonymize_failed", r.user.id, { userId, companyId, perimeterId }, { error: message }, correlationId);
+        return res.status(status).json({
+            ok: false,
+            error: status === 404 ? "USER_NOT_FOUND_IN_SCOPE" : "GDPR_USER_DELETE_FAILED",
+            detail: message,
+            correlationId,
+        });
+    }
+});
 // Harness-only namespace: all /api/admin/test-scenarios/* endpoints are dev/staging only.
 adminRouter.use("/test-scenarios", (req, res, next) => {
     if (harnessOnly(req, res))
         return;
     next();
 });
+adminRouter.use("/test-scenarios", requireOperationalPerimeterAdmin);
 /**
  * POST /api/admin/test-scenarios/:id/initialize
  * HARNESS ONLY — dev/staging. Destructively overwrites live application data
@@ -296,7 +550,7 @@ adminRouter.post("/users/invite", async (req, res) => {
 /**
  * GET /api/admin/users/active
  */
-adminRouter.get("/users/active", async (req, res, next) => {
+adminRouter.get("/users/active", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
@@ -451,7 +705,7 @@ adminRouter.post("/users/reset-active", async (req, res) => {
 /**
  * GET /api/admin/campaign-status
  */
-adminRouter.get("/campaign-status", async (req, res) => {
+adminRouter.get("/campaign-status", requireOperationalPerimeterAdmin, async (req, res) => {
     try {
         const { perimeterId } = getTenantScope(req);
         const correlationId = req.correlationId;
@@ -472,7 +726,7 @@ adminRouter.get("/campaign-status", async (req, res) => {
  * PATCH /api/admin/campaign-status
  * Body: { campaign_status: 'open' | 'closed' }
  */
-adminRouter.patch("/campaign-status", async (req, res) => {
+adminRouter.patch("/campaign-status", requireOperationalPerimeterAdmin, async (req, res) => {
     const r = req;
     const correlationId = req.correlationId;
     try {
@@ -496,7 +750,7 @@ adminRouter.patch("/campaign-status", async (req, res) => {
         return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
     }
 });
-adminRouter.get("/candidatures", async (req, res, next) => {
+adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
@@ -541,7 +795,7 @@ adminRouter.get("/candidatures", async (req, res, next) => {
         next(e);
     }
 });
-adminRouter.get("/users", async (req, res, next) => {
+adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         const { rows } = await pool.query(`
@@ -1017,7 +1271,7 @@ adminRouter.post("/test-scenarios/:id/applications", async (req, res, next) => {
 /**
  * GET /api/admin/interlocking-scenarios
  */
-adminRouter.get("/interlocking-scenarios", async (req, res, next) => {
+adminRouter.get("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = req.correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
@@ -1055,7 +1309,7 @@ adminRouter.get("/interlocking-scenarios", async (req, res, next) => {
         next(e);
     }
 });
-adminRouter.get("/interlocking-scenarios/export.csv", async (req, res, next) => {
+adminRouter.get("/interlocking-scenarios/export.csv", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = req.correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
@@ -1115,7 +1369,7 @@ adminRouter.get("/interlocking-scenarios/export.csv", async (req, res, next) => 
 /**
  * POST /api/admin/interlocking-scenarios
  */
-adminRouter.post("/interlocking-scenarios", async (req, res) => {
+adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req, res) => {
     const r = req;
     const correlationId = req.correlationId;
     try {
@@ -1207,7 +1461,7 @@ adminRouter.post("/interlocking-scenarios", async (req, res) => {
  * DELETE /api/admin/interlocking-scenarios
  * body: { ids: string[] }
  */
-adminRouter.delete("/interlocking-scenarios", async (req, res) => {
+adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req, res) => {
     const r = req;
     const correlationId = req.correlationId;
     try {

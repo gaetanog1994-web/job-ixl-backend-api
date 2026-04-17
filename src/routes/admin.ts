@@ -3,13 +3,11 @@ import { withTx, pool, supabaseAdmin } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js";
-import { graphAdminRouter } from "./graphAdmin.js";
 import { deactivateUserAndCleanup } from "../services/users.js";
 import { rebalanceApplications, type RebalanceApplicationRow } from "../services/rebalanceApplications.js";
 import { requireOperationalPerimeterAdmin } from "../tenant.js";
 
 export const adminRouter = Router();
-adminRouter.use("/graph", graphAdminRouter);
 
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;

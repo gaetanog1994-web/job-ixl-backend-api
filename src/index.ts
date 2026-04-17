@@ -16,7 +16,6 @@ import { mapRouter } from "./routes/map.js";
 import { applicationsRouter } from "./routes/applications.js";
 import { usersRouter } from "./routes/users.js";
 import { publicRouter } from "./routes/public.js";
-import { graphAdminRouter } from "./routes/graphAdmin.js";
 import { platformRouter } from "./routes/platform.js";
 import {
     attachAccessContext,
@@ -324,10 +323,7 @@ adminApi.use((req, _res, next) => {
     next();
 });
 
-// 3) graph chains server-side (Postgres SoT path, intentionally before proxy)
-adminApi.use("/graph", graphAdminRouter);
-
-// 4) graph proxy (Neo4j warmup/summary and other forwarded graph endpoints)
+// 3) graph proxy (Neo4j warmup/chains/summary and other forwarded graph endpoints)
 adminApi.use("/graph", graphProxyRouter);
 
 // mount unico
