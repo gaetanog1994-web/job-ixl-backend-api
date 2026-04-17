@@ -173,10 +173,6 @@ function normalizeImportCellValue(value: unknown): string {
     return "";
 }
 
-function escapeExcelListValue(value: string): string {
-    return value.replace(/"/g, "\"\"");
-}
-
 function isValidEmailFormat(email: string): boolean {
     return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
 }
@@ -1250,6 +1246,8 @@ adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, asyn
 
         const workbook = new ExcelJS.Workbook();
         const sheet = workbook.addWorksheet("Utenti");
+        const listsSheet = workbook.addWorksheet("_Liste");
+        listsSheet.state = "veryHidden";
         sheet.columns = [
             { header: "Nome", key: "nome", width: 24 },
             { header: "Cognome", key: "cognome", width: 24 },
@@ -1282,20 +1280,30 @@ adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, asyn
         ]);
         sampleRow.font = { italic: true, color: { argb: "FF7A7A7A" } };
 
-        const roleValidationFormula = roleNames.length
-            ? `"${roleNames.map(escapeExcelListValue).join(",")}"`
-            : "\"\"";
-        const locationValidationFormula = locationNames.length
-            ? `"${locationNames.map(escapeExcelListValue).join(",")}"`
-            : "\"\"";
-        const fixedLocationValidationFormula = `"${fixedLocationValues.join(",")}"`;
+        const safeRoleNames = roleNames.length > 0 ? roleNames : [""];
+        const safeLocationNames = locationNames.length > 0 ? locationNames : [""];
+        const safeFixedLocationValues = fixedLocationValues.length > 0 ? fixedLocationValues : [""];
+
+        safeRoleNames.forEach((name, index) => {
+            listsSheet.getCell(`A${index + 1}`).value = name;
+        });
+        safeLocationNames.forEach((name, index) => {
+            listsSheet.getCell(`B${index + 1}`).value = name;
+        });
+        safeFixedLocationValues.forEach((name, index) => {
+            listsSheet.getCell(`C${index + 1}`).value = name;
+        });
+
+        workbook.definedNames.add("_ruoli_import", `_Liste!$A$1:$A$${safeRoleNames.length}`);
+        workbook.definedNames.add("_sedi_import", `_Liste!$B$1:$B$${safeLocationNames.length}`);
+        workbook.definedNames.add("_sede_vincolante_import", `_Liste!$C$1:$C$${safeFixedLocationValues.length}`);
 
         for (let rowNumber = 2; rowNumber <= 500; rowNumber += 1) {
             const roleCell = sheet.getCell(`E${rowNumber}`);
             roleCell.dataValidation = {
                 type: "list",
                 allowBlank: true,
-                formulae: [roleValidationFormula],
+                formulae: ["=_ruoli_import"],
                 showErrorMessage: true,
                 errorTitle: "Ruolo non valido",
                 error: "Seleziona un ruolo tra quelli disponibili nel menu a tendina.",
@@ -1305,7 +1313,7 @@ adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, asyn
             locationCell.dataValidation = {
                 type: "list",
                 allowBlank: true,
-                formulae: [locationValidationFormula],
+                formulae: ["=_sedi_import"],
                 showErrorMessage: true,
                 errorTitle: "Sede non valida",
                 error: "Seleziona una sede tra quelle disponibili nel menu a tendina.",
@@ -1315,7 +1323,7 @@ adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, asyn
             fixedLocationCell.dataValidation = {
                 type: "list",
                 allowBlank: true,
-                formulae: [fixedLocationValidationFormula],
+                formulae: ["=_sede_vincolante_import"],
                 showErrorMessage: true,
                 errorTitle: "Valore non valido",
                 error: "Usa Sì oppure No.",
