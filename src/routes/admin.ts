@@ -1,4 +1,7 @@
 import { Router, Request, Response } from "express";
+import ExcelJS from "exceljs";
+import multer from "multer";
+import { Readable } from "stream";
 import { withTx, pool, supabaseAdmin } from "../db.js";
 import type { AuthedRequest } from "../auth.js";
 import { audit } from "../audit.js";
@@ -6,8 +9,13 @@ import { invalidateMapCache } from "./map.js";
 import { deactivateUserAndCleanup } from "../services/users.js";
 import { rebalanceApplications, type RebalanceApplicationRow } from "../services/rebalanceApplications.js";
 import { requireOperationalPerimeterAdmin } from "../tenant.js";
+import { normalizeEmailInput, resolveAuthUserByEmail } from "../services/authUsers.js";
 
 export const adminRouter = Router();
+const uploadExcel = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: 5 * 1024 * 1024 },
+});
 
 const GRAPH_SERVICE_URL = process.env.GRAPH_SERVICE_URL!;
 const GRAPH_SERVICE_TOKEN = process.env.GRAPH_SERVICE_TOKEN!;
@@ -152,6 +160,75 @@ function getTenantScope(req: Request) {
         companyId: access?.currentCompanyId ?? null,
         perimeterId: access?.currentPerimeterId ?? null,
     };
+}
+
+function normalizeImportCellValue(value: unknown): string {
+    if (typeof value === "string") return value.trim();
+    if (typeof value === "number") return String(value).trim();
+    if (typeof value === "boolean") return value ? "Sì" : "No";
+    if (value instanceof Date) return value.toISOString();
+    if (value && typeof value === "object" && "text" in (value as Record<string, unknown>)) {
+        return String((value as Record<string, unknown>).text ?? "").trim();
+    }
+    return "";
+}
+
+function escapeExcelListValue(value: string): string {
+    return value.replace(/"/g, "\"\"");
+}
+
+function isValidEmailFormat(email: string): boolean {
+    return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email);
+}
+
+function parseFixedLocation(value: string): boolean | null {
+    const normalized = value.trim().toLowerCase();
+    if (!normalized) return false;
+    if (normalized === "sì" || normalized === "si") return true;
+    if (normalized === "no") return false;
+    return null;
+}
+
+type BulkImportErrorItem = {
+    row: number;
+    email: string;
+    error: string;
+};
+
+async function resolveOrInviteAuthUserId(params: {
+    email: string;
+    firstName: string;
+    lastName: string;
+    fullName: string;
+}): Promise<string> {
+    const { email, firstName, lastName, fullName } = params;
+    const authAdmin = (supabaseAdmin.auth.admin as any);
+
+    const inviteResult = await authAdmin.inviteUserByEmail(email, {
+        data: {
+            first_name: firstName || null,
+            last_name: lastName || null,
+            full_name: fullName,
+        },
+    });
+
+    const inviteError = inviteResult?.error ?? null;
+    const invitedUserId = inviteResult?.data?.user?.id ?? null;
+    if (!inviteError && invitedUserId) return invitedUserId;
+
+    if (typeof authAdmin.getUserByEmail === "function") {
+        const userByEmail = await authAdmin.getUserByEmail(email);
+        const existingByEmailId = userByEmail?.data?.user?.id ?? null;
+        if (existingByEmailId) return existingByEmailId;
+    }
+
+    const existingUser = await resolveAuthUserByEmail(authAdmin, email);
+    if (existingUser?.id) return existingUser.id;
+
+    if (inviteError?.message) {
+        throw new Error(inviteError.message);
+    }
+    throw new Error("Impossibile invitare o risolvere utente auth");
 }
 
 async function getTableColumns(
@@ -1128,6 +1205,389 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
         next(e);
     }
 });
+
+/**
+ * GET /api/admin/users/import-template
+ * Download Excel template for bulk user import scoped to current company/perimeter.
+ */
+adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({
+                ok: false,
+                error: "PERIMETER_CONTEXT_REQUIRED",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+
+        const [rolesRes, locationsRes] = await Promise.all([
+            pool.query<{ name: string }>(
+                `
+                select name
+                from roles
+                where company_id = $1
+                  and perimeter_id = $2
+                order by name asc
+                `,
+                [companyId, perimeterId]
+            ),
+            pool.query<{ name: string }>(
+                `
+                select name
+                from locations
+                where company_id = $1
+                  and perimeter_id = $2
+                order by name asc
+                `,
+                [companyId, perimeterId]
+            ),
+        ]);
+
+        const roleNames = rolesRes.rows.map((r) => String(r.name ?? "").trim()).filter(Boolean);
+        const locationNames = locationsRes.rows.map((l) => String(l.name ?? "").trim()).filter(Boolean);
+        const fixedLocationValues = ["Sì", "No"];
+
+        const workbook = new ExcelJS.Workbook();
+        const sheet = workbook.addWorksheet("Utenti");
+        sheet.columns = [
+            { header: "Nome", key: "nome", width: 24 },
+            { header: "Cognome", key: "cognome", width: 24 },
+            { header: "Email", key: "email", width: 32 },
+            { header: "HR Responsabile", key: "hrResponsabile", width: 28 },
+            { header: "Ruolo", key: "ruolo", width: 26 },
+            { header: "Sede", key: "sede", width: 26 },
+            { header: "Sede vincolante", key: "sedeVincolante", width: 18 },
+        ];
+
+        const headerRow = sheet.getRow(1);
+        headerRow.font = { bold: true };
+        headerRow.fill = {
+            type: "pattern",
+            pattern: "solid",
+            fgColor: { argb: "FFD9EAF7" },
+        };
+        headerRow.alignment = { vertical: "middle", horizontal: "center" };
+
+        const sampleRole = roleNames[0] ?? "Ruolo esempio";
+        const sampleLocation = locationNames[0] ?? "Sede esempio";
+        const sampleRow = sheet.addRow([
+            "Mario",
+            "Rossi",
+            "mario.rossi@azienda.it",
+            "Anna Verdi",
+            sampleRole,
+            sampleLocation,
+            "No",
+        ]);
+        sampleRow.font = { italic: true, color: { argb: "FF7A7A7A" } };
+
+        const roleValidationFormula = roleNames.length
+            ? `"${roleNames.map(escapeExcelListValue).join(",")}"`
+            : "\"\"";
+        const locationValidationFormula = locationNames.length
+            ? `"${locationNames.map(escapeExcelListValue).join(",")}"`
+            : "\"\"";
+        const fixedLocationValidationFormula = `"${fixedLocationValues.join(",")}"`;
+
+        for (let rowNumber = 2; rowNumber <= 500; rowNumber += 1) {
+            const roleCell = sheet.getCell(`E${rowNumber}`);
+            roleCell.dataValidation = {
+                type: "list",
+                allowBlank: true,
+                formulae: [roleValidationFormula],
+                showErrorMessage: true,
+                errorTitle: "Ruolo non valido",
+                error: "Seleziona un ruolo tra quelli disponibili nel menu a tendina.",
+            };
+
+            const locationCell = sheet.getCell(`F${rowNumber}`);
+            locationCell.dataValidation = {
+                type: "list",
+                allowBlank: true,
+                formulae: [locationValidationFormula],
+                showErrorMessage: true,
+                errorTitle: "Sede non valida",
+                error: "Seleziona una sede tra quelle disponibili nel menu a tendina.",
+            };
+
+            const fixedLocationCell = sheet.getCell(`G${rowNumber}`);
+            fixedLocationCell.dataValidation = {
+                type: "list",
+                allowBlank: true,
+                formulae: [fixedLocationValidationFormula],
+                showErrorMessage: true,
+                errorTitle: "Valore non valido",
+                error: "Usa Sì oppure No.",
+            };
+        }
+
+        const fileBuffer = await workbook.xlsx.writeBuffer();
+        res.setHeader(
+            "Content-Type",
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        res.setHeader(
+            "Content-Disposition",
+            "attachment; filename=\"template_importazione_utenti.xlsx\""
+        );
+        return res.status(200).send(fileBuffer);
+    } catch (e: any) {
+        return res.status(500).json({
+            ok: false,
+            error: "IMPORT_TEMPLATE_GENERATION_FAILED",
+            detail: String(e?.message ?? e),
+            correlationId: (req as any).correlationId ?? null,
+        });
+    }
+});
+
+/**
+ * POST /api/admin/users/import
+ * Multipart upload: field "file" (.xlsx)
+ */
+adminRouter.post(
+    "/users/import",
+    requireOperationalPerimeterAdmin,
+    uploadExcel.single("file"),
+    async (req: Request, res: Response) => {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId;
+        const file = (req as Request & { file?: Express.Multer.File }).file;
+
+        try {
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            if (!file) {
+                return res.status(400).json({ ok: false, error: "FILE_REQUIRED", correlationId });
+            }
+            if (!String(file.originalname ?? "").toLowerCase().endsWith(".xlsx")) {
+                return res.status(400).json({ ok: false, error: "INVALID_FILE_TYPE", detail: "Carica un file .xlsx", correlationId });
+            }
+
+            const workbook = new ExcelJS.Workbook();
+            await workbook.xlsx.read(Readable.from(file.buffer));
+            const sheet = workbook.getWorksheet("Utenti") ?? workbook.worksheets[0];
+            if (!sheet) {
+                return res.status(400).json({ ok: false, error: "WORKSHEET_NOT_FOUND", correlationId });
+            }
+
+            const [rolesRes, locationsRes] = await Promise.all([
+                pool.query<{ id: string; name: string }>(
+                    `
+                    select id, name
+                    from roles
+                    where company_id = $1
+                      and perimeter_id = $2
+                    `,
+                    [companyId, perimeterId]
+                ),
+                pool.query<{ id: string; name: string }>(
+                    `
+                    select id, name
+                    from locations
+                    where company_id = $1
+                      and perimeter_id = $2
+                    `,
+                    [companyId, perimeterId]
+                ),
+            ]);
+
+            const roleByName = new Map<string, string>();
+            for (const role of rolesRes.rows) {
+                roleByName.set(String(role.name ?? "").trim(), role.id);
+            }
+
+            const locationByName = new Map<string, string>();
+            for (const location of locationsRes.rows) {
+                locationByName.set(String(location.name ?? "").trim(), location.id);
+            }
+
+            let total = 0;
+            let imported = 0;
+            const errors: BulkImportErrorItem[] = [];
+
+            for (let rowNumber = 2; rowNumber <= sheet.rowCount; rowNumber += 1) {
+                const row = sheet.getRow(rowNumber);
+                const nome = normalizeImportCellValue(row.getCell(1).value);
+                const cognome = normalizeImportCellValue(row.getCell(2).value);
+                const emailRaw = normalizeImportCellValue(row.getCell(3).value);
+                const hrResponsabile = normalizeImportCellValue(row.getCell(4).value);
+                const ruolo = normalizeImportCellValue(row.getCell(5).value);
+                const sede = normalizeImportCellValue(row.getCell(6).value);
+                const sedeVincolanteRaw = normalizeImportCellValue(row.getCell(7).value);
+
+                const isEmptyRow = [nome, cognome, emailRaw, hrResponsabile, ruolo, sede, sedeVincolanteRaw]
+                    .every((value) => !value);
+                if (isEmptyRow) continue;
+
+                const loweredEmailRaw = emailRaw.toLowerCase();
+                const isSampleRow = loweredEmailRaw.includes("azienda.it") || nome.toLowerCase() === "mario";
+                if (isSampleRow) continue;
+
+                total += 1;
+
+                if (!nome) {
+                    errors.push({ row: rowNumber, email: emailRaw, error: "Nome mancante" });
+                    continue;
+                }
+                if (!cognome) {
+                    errors.push({ row: rowNumber, email: emailRaw, error: "Cognome mancante" });
+                    continue;
+                }
+                if (!emailRaw) {
+                    errors.push({ row: rowNumber, email: "", error: "Email mancante" });
+                    continue;
+                }
+
+                let email: string;
+                try {
+                    email = normalizeEmailInput(emailRaw);
+                } catch {
+                    errors.push({ row: rowNumber, email: emailRaw, error: "Email non valida" });
+                    continue;
+                }
+
+                if (!isValidEmailFormat(email)) {
+                    errors.push({ row: rowNumber, email, error: "Email non valida" });
+                    continue;
+                }
+
+                if (!ruolo) {
+                    errors.push({ row: rowNumber, email, error: "Ruolo mancante" });
+                    continue;
+                }
+                if (!sede) {
+                    errors.push({ row: rowNumber, email, error: "Sede mancante" });
+                    continue;
+                }
+
+                const roleId = roleByName.get(ruolo);
+                if (!roleId) {
+                    errors.push({ row: rowNumber, email, error: `Ruolo '${ruolo}' non trovato` });
+                    continue;
+                }
+
+                const locationId = locationByName.get(sede);
+                if (!locationId) {
+                    errors.push({ row: rowNumber, email, error: `Sede '${sede}' non trovata` });
+                    continue;
+                }
+
+                const fixedLocation = parseFixedLocation(sedeVincolanteRaw);
+                if (fixedLocation === null) {
+                    errors.push({ row: rowNumber, email, error: "Sede vincolante deve essere 'Sì' o 'No'" });
+                    continue;
+                }
+
+                const fullName = `${nome} ${cognome}`.trim().replace(/\s+/g, " ");
+
+                try {
+                    const authUserId = await resolveOrInviteAuthUserId({
+                        email,
+                        firstName: nome,
+                        lastName: cognome,
+                        fullName,
+                    });
+
+                    await withTx(async (client) => {
+                        await client.query(
+                            `
+                            insert into users (
+                                id,
+                                first_name,
+                                last_name,
+                                full_name,
+                                email,
+                                role_id,
+                                location_id,
+                                fixed_location,
+                                company_id,
+                                perimeter_id,
+                                home_perimeter_id,
+                                availability_status,
+                                created_by,
+                                updated_by,
+                                application_count
+                            )
+                            values (
+                                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, 'inactive', $11, $11, 0
+                            )
+                            on conflict (id) do update
+                              set first_name = excluded.first_name,
+                                  last_name = excluded.last_name,
+                                  full_name = excluded.full_name,
+                                  email = excluded.email,
+                                  role_id = excluded.role_id,
+                                  location_id = excluded.location_id,
+                                  fixed_location = excluded.fixed_location,
+                                  company_id = excluded.company_id,
+                                  perimeter_id = excluded.perimeter_id,
+                                  home_perimeter_id = excluded.home_perimeter_id,
+                                  availability_status = 'inactive',
+                                  updated_by = excluded.updated_by
+                            `,
+                            [authUserId, nome, cognome, fullName, email, roleId, locationId, fixedLocation, companyId, perimeterId, r.user.id]
+                        );
+
+                        await client.query(
+                            `
+                            insert into perimeter_memberships (
+                                user_id,
+                                company_id,
+                                perimeter_id,
+                                access_role,
+                                status,
+                                created_by
+                            )
+                            values ($1, $2, $3, 'user', 'active', $4)
+                            on conflict (perimeter_id, user_id) do update
+                              set company_id = excluded.company_id,
+                                  access_role = excluded.access_role,
+                                  status = excluded.status
+                            `,
+                            [authUserId, companyId, perimeterId, r.user.id]
+                        );
+                    });
+
+                    // TODO: "HR Responsabile" va persistito come nota strutturata quando avremo un campo dedicato.
+                    void hrResponsabile;
+                    imported += 1;
+                } catch (e: any) {
+                    errors.push({
+                        row: rowNumber,
+                        email,
+                        error: String(e?.message ?? "Errore durante importazione utente"),
+                    });
+                }
+            }
+
+            await audit(
+                "bulk_user_import",
+                r.user.id,
+                { companyId, perimeterId },
+                { total, imported, errors: errors.length },
+                correlationId
+            );
+
+            return res.status(200).json({
+                total,
+                imported,
+                errors,
+                correlationId,
+            });
+        } catch (e: any) {
+            return res.status(500).json({
+                ok: false,
+                error: "BULK_USER_IMPORT_FAILED",
+                detail: String(e?.message ?? e),
+                correlationId,
+            });
+        }
+    }
+);
 
 adminRouter.post("/users", async (req, res, next) => {
     try {
