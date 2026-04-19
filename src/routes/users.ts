@@ -3,7 +3,11 @@ import { type AuthedRequest } from "../auth.js";
 import { pool, withTx } from "../db.js";
 import { audit } from "../audit.js";
 import { invalidateMapCache } from "./map.js";
-import { deactivateUserAndCleanup } from "../services/users.js";
+import {
+  deriveUserState,
+  loadPerimeterLifecycle,
+  validateUserReservationAction,
+} from "../services/campaignLifecycle.js";
 
 
 // src/routes/users.ts
@@ -40,9 +44,9 @@ usersRouter.post("/me/ensure", async (req: Request, res: Response, next: NextFun
             `
       insert into users (
         id, email, first_name, last_name, full_name, location_id, availability_status,
-        application_count, company_id, perimeter_id, home_perimeter_id, updated_by
+        is_reserved, application_count, company_id, perimeter_id, home_perimeter_id, updated_by
       )
-      values ($1, $2, $3, $4, $5, $6, 'inactive', 0, $7, $8, $8, $1)
+      values ($1, $2, $3, $4, $5, $6, 'inactive', false, 0, $7, $8, $8, $1)
       on conflict (id) do update
         set first_name = excluded.first_name,
             last_name = excluded.last_name,
@@ -52,7 +56,7 @@ usersRouter.post("/me/ensure", async (req: Request, res: Response, next: NextFun
             perimeter_id = coalesce(excluded.perimeter_id, users.perimeter_id),
             home_perimeter_id = coalesce(excluded.home_perimeter_id, users.home_perimeter_id),
             updated_by = excluded.updated_by
-      returning id, email, first_name, last_name, full_name, location_id, availability_status, application_count, role_id, fixed_location, company_id, perimeter_id, home_perimeter_id
+      returning id, email, first_name, last_name, full_name, location_id, availability_status, is_reserved, application_count, role_id, fixed_location, company_id, perimeter_id, home_perimeter_id
       `,
             [
                 r.user.id,
@@ -93,6 +97,7 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
          u.last_name,
          u.full_name,
          u.availability_status,
+         u.is_reserved,
          u.location_id,
          u.role_id,
          u.fixed_location,
@@ -101,7 +106,9 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
          l.name as location_name,
          r.name as role_name,
          c.name as company_name,
-         p.name as perimeter_name
+         p.name as perimeter_name,
+         p.campaign_status,
+         p.reservations_status
        from users u
        left join locations l on l.id = u.location_id
        left join roles r on r.id = u.role_id
@@ -124,6 +131,10 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
             ok: true,
             user: {
                 ...rows[0],
+                user_state: deriveUserState({
+                    availabilityStatus: rows[0]?.availability_status ?? null,
+                    isReserved: rows[0]?.is_reserved ?? false,
+                }),
                 access_role: access?.accessRole ?? null,
                 is_owner: access?.isOwner ?? false,
                 is_super_admin: access?.isCompanySuperAdmin ?? false,
@@ -212,11 +223,23 @@ usersRouter.get("/me/applications", async (req, res, next) => {
 
 /**
  * POST /api/users/me/deactivate
- * Self-service: l'utente diventa "inactive" + cleanup COMPLETO delle sue applications.
- * Uses deactivateUserAndCleanup service — deletes both outgoing AND incoming applications
- * and recalculates application_count for affected users.
+ * Legacy endpoint intentionally disabled in RC2 lifecycle.
  */
 usersRouter.post("/me/deactivate", async (req, res) => {
+    const correlationId = (req as any).correlationId;
+    return res.status(409).json({
+        ok: false,
+        code: "MANUAL_AVAILABILITY_DISABLED",
+        error: "Use reservation window actions; manual availability changes are disabled",
+        correlationId,
+    });
+});
+
+/**
+ * POST /api/users/me/reservation
+ * Reserve current user for next campaign (allowed only in reservation window).
+ */
+usersRouter.post("/me/reservation", async (req, res) => {
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
     const companyId = r.accessContext?.currentCompanyId ?? null;
@@ -227,15 +250,162 @@ usersRouter.post("/me/deactivate", async (req, res) => {
     }
 
     try {
-        const out = await deactivateUserAndCleanup(r.user.id, companyId, perimeterId, {
-            actorId: r.user.id,
-            setShowPositionFalse: true, // self-deactivate also hides user from map
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) {
+                return { missingPerimeter: true as const };
+            }
+
+            const userRes = await client.query<{ is_reserved: boolean; availability_status: string }>(
+                `
+                select is_reserved, availability_status
+                from users
+                where id = $1
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                limit 1
+                `,
+                [r.user.id, companyId, perimeterId]
+            );
+            if (!userRes.rows.length) {
+                return { missingUser: true as const };
+            }
+
+            const invalid = validateUserReservationAction({
+                lifecycle,
+                action: "reserve",
+                isReserved: Boolean(userRes.rows[0].is_reserved),
+            });
+            if (invalid) return { invalid } as const;
+
+            const updated = await client.query(
+                `
+                update users
+                set is_reserved = true,
+                    availability_status = 'inactive',
+                    show_position = false
+                where id = $1
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                returning availability_status, is_reserved
+                `,
+                [r.user.id, companyId, perimeterId]
+            );
+
+            return {
+                user_state: deriveUserState({
+                    availabilityStatus: updated.rows[0]?.availability_status ?? "inactive",
+                    isReserved: updated.rows[0]?.is_reserved ?? true,
+                }),
+                campaign_status: lifecycle.campaignStatus,
+                reservations_status: lifecycle.reservationsStatus,
+            };
         });
-        await audit("user_deactivate_self", r.user.id, {}, out, correlationId);
-        return res.status(200).json({ ok: true, out, correlationId });
+
+        if ("missingPerimeter" in out) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        if ("missingUser" in out) {
+            return res.status(404).json({ ok: false, error: "USER_NOT_FOUND", correlationId });
+        }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
+        invalidateMapCache();
+        await audit("user_reserve_for_campaign", r.user.id, {}, out, correlationId);
+        return res.status(200).json({ ok: true, ...out, correlationId });
     } catch (e: any) {
-        await audit("user_deactivate_self", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
-        return res.status(500).json({ error: "Deactivate failed", correlationId });
+        await audit("user_reserve_for_campaign", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
+        return res.status(500).json({ error: "RESERVE_FAILED", correlationId });
+    }
+});
+
+/**
+ * DELETE /api/users/me/reservation
+ * Unreserve current user (allowed only in reservation window).
+ */
+usersRouter.delete("/me/reservation", async (req, res) => {
+    const r = req as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    const companyId = r.accessContext?.currentCompanyId ?? null;
+    const perimeterId = r.accessContext?.currentPerimeterId ?? null;
+
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+
+    try {
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) {
+                return { missingPerimeter: true as const };
+            }
+
+            const userRes = await client.query<{ is_reserved: boolean; availability_status: string }>(
+                `
+                select is_reserved, availability_status
+                from users
+                where id = $1
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                limit 1
+                `,
+                [r.user.id, companyId, perimeterId]
+            );
+            if (!userRes.rows.length) {
+                return { missingUser: true as const };
+            }
+
+            const invalid = validateUserReservationAction({
+                lifecycle,
+                action: "unreserve",
+                isReserved: Boolean(userRes.rows[0].is_reserved),
+            });
+            if (invalid) return { invalid } as const;
+
+            const updated = await client.query(
+                `
+                update users
+                set is_reserved = false,
+                    availability_status = 'inactive',
+                    show_position = false
+                where id = $1
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                returning availability_status, is_reserved
+                `,
+                [r.user.id, companyId, perimeterId]
+            );
+
+            return {
+                user_state: deriveUserState({
+                    availabilityStatus: updated.rows[0]?.availability_status ?? "inactive",
+                    isReserved: updated.rows[0]?.is_reserved ?? false,
+                }),
+                campaign_status: lifecycle.campaignStatus,
+                reservations_status: lifecycle.reservationsStatus,
+            };
+        });
+
+        if ("missingPerimeter" in out) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        if ("missingUser" in out) {
+            return res.status(404).json({ ok: false, error: "USER_NOT_FOUND", correlationId });
+        }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
+        invalidateMapCache();
+        await audit("user_unreserve_for_campaign", r.user.id, {}, out, correlationId);
+        return res.status(200).json({ ok: true, ...out, correlationId });
+    } catch (e: any) {
+        await audit("user_unreserve_for_campaign", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
+        return res.status(500).json({ error: "UNRESERVE_FAILED", correlationId });
     }
 });
 
@@ -336,43 +506,14 @@ usersRouter.post("/:userId/reorder-applications", async (req: Request, res: Resp
 
 /**
  * POST /api/users/me/activate
- * Self-service: l'utente torna "available"
+ * Legacy endpoint intentionally disabled in RC2 lifecycle.
  */
 usersRouter.post("/me/activate", async (req, res) => {
-
-    const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
-
-    try {
-        const out = await withTx(async (client) => {
-            const upd = await client.query(
-                `
-                update users
-                    set availability_status = 'available',
-                        show_position = true,
-                        updated_by = $1
-                    where id = $1
-                      and company_id = $2
-                      and coalesce(perimeter_id, home_perimeter_id) = $3
-                    returning id, availability_status, show_position
-                `,
-                [r.user.id, r.accessContext?.currentCompanyId ?? null, r.accessContext?.currentPerimeterId ?? null]
-            );
-
-            return {
-                userId: r.user.id,
-                status: upd.rows?.[0]?.availability_status ?? "available",
-                showPosition: upd.rows?.[0]?.show_position ?? true,
-            };
-
-        });
-
-        invalidateMapCache(); // ✅ ESATTAMENTE QUI (come deactivate)
-
-        await audit("user_activate_self", r.user.id, {}, out, correlationId);
-        return res.status(200).json({ ok: true, out, correlationId });
-    } catch (e: any) {
-        await audit("user_activate_self", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
-        return res.status(500).json({ error: "Activate failed", correlationId });
-    }
+    return res.status(409).json({
+        ok: false,
+        code: "MANUAL_AVAILABILITY_DISABLED",
+        error: "Use reservation window actions; manual availability changes are disabled",
+        correlationId,
+    });
 });

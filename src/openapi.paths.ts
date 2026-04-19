@@ -47,18 +47,32 @@
  * /api/users/me/activate:
  *   post:
  *     tags: [Users]
- *     summary: Activate authenticated user
+ *     summary: Legacy endpoint (disabled) - manual availability changes are not allowed
  *     security: [{ bearerAuth: [] }]
  *     responses:
- *       200: { description: User activated }
+ *       409: { description: Manual availability disabled }
  *
  * /api/users/me/deactivate:
  *   post:
  *     tags: [Users]
- *     summary: Deactivate authenticated user and cleanup applications
+ *     summary: Legacy endpoint (disabled) - manual availability changes are not allowed
  *     security: [{ bearerAuth: [] }]
  *     responses:
- *       200: { description: User deactivated }
+ *       409: { description: Manual availability disabled }
+ *
+ * /api/users/me/reservation:
+ *   post:
+ *     tags: [Users]
+ *     summary: Reserve authenticated user for next campaign (reservation window only)
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: User reserved }
+ *   delete:
+ *     tags: [Users]
+ *     summary: Unreserve authenticated user (reservation window only)
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: User unreserved }
  *
  * /api/users/{userId}/reorder-applications:
  *   post:
@@ -300,16 +314,48 @@
  * /api/admin/campaign-status:
  *   get:
  *     tags: [Admin]
- *     summary: Get perimeter campaign status
+ *     summary: Get perimeter campaign + reservation lifecycle status
  *     security: [{ bearerAuth: [] }]
  *     responses:
- *       200: { description: Campaign status }
+ *       200: { description: Lifecycle status }
  *   patch:
  *     tags: [Admin]
- *     summary: Update perimeter campaign status
+ *     summary: Legacy endpoint (disabled) - use explicit lifecycle endpoints
  *     security: [{ bearerAuth: [] }]
  *     responses:
- *       200: { description: Campaign status updated }
+ *       410: { description: Deprecated endpoint }
+ *
+ * /api/admin/reservations/open:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Open reservation window
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: Reservation window opened }
+ *
+ * /api/admin/reservations/close:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Close reservation window
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: Reservation window closed }
+ *
+ * /api/admin/campaign/open:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Open campaign after reservation window closure
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: Campaign opened }
+ *
+ * /api/admin/campaign/close:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Close campaign and reset users/applications
+ *     security: [{ bearerAuth: [] }]
+ *     responses:
+ *       200: { description: Campaign closed and state reset }
  *
  * /api/admin/candidatures:
  *   get:

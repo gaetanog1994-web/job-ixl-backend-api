@@ -10,6 +10,14 @@ import { deactivateUserAndCleanup } from "../services/users.js";
 import { rebalanceApplications, type RebalanceApplicationRow } from "../services/rebalanceApplications.js";
 import { requireOperationalPerimeterAdmin } from "../tenant.js";
 import { normalizeEmailInput, resolveAuthUserByEmail } from "../services/authUsers.js";
+import {
+    deriveUserState,
+    loadPerimeterLifecycle,
+    validateCloseCampaign,
+    validateCloseReservations,
+    validateOpenCampaign,
+    validateOpenReservations,
+} from "../services/campaignLifecycle.js";
 
 export const adminRouter = Router();
 const uploadExcel = multer({
@@ -878,38 +886,19 @@ adminRouter.get("/users/active", requireOperationalPerimeterAdmin, async (req, r
 
 /**
  * POST /api/admin/users/:id/deactivate
- * Uses deactivateUserAndCleanup service (replaces DB trigger).
- * Deletes both outgoing AND incoming applications, recalculates affected counts.
+ * Legacy endpoint kept for compatibility.
+ * Manual availability changes are no longer allowed in lifecycle RC2.
  */
 adminRouter.post(
     "/users/:id/deactivate",
     async (req: Request, res: Response) => {
-        const r = req as unknown as AuthedRequest;
-        const userId = req.params.id;
         const correlationId = (req as any).correlationId;
-        const { companyId, perimeterId } = getTenantScope(req);
-
-        if (!companyId || !perimeterId) {
-            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
-        }
-
-        try {
-            const out = await deactivateUserAndCleanup(userId, companyId, perimeterId, {
-                actorId: r.user.id,
-            });
-
-            await audit("user_deactivate", r.user.id, { userId }, out, correlationId);
-            return res.status(200).json({ ok: true, out, correlationId });
-        } catch (e: any) {
-            await audit(
-                "user_deactivate",
-                r.user.id,
-                { userId },
-                { error: String(e?.message ?? e) },
-                correlationId
-            );
-            return res.status(500).json({ error: "Deactivate failed", correlationId });
-        }
+        return res.status(409).json({
+            ok: false,
+            code: "MANUAL_AVAILABILITY_DISABLED",
+            error: "User availability is managed only by reservation/campaign lifecycle",
+            correlationId,
+        });
     }
 );
 
@@ -1053,55 +1042,303 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
     }
 });
 
+async function readLifecycleSnapshot(client: import("pg").PoolClient, companyId: string, perimeterId: string) {
+    const lifecycle = await loadPerimeterLifecycle(client, perimeterId);
+    if (!lifecycle) return null;
+
+    const [reservedUsersRes, availableUsersRes] = await Promise.all([
+        client.query<{ cnt: string }>(
+            `
+            select count(*)::text as cnt
+            from users
+            where company_id = $1
+              and coalesce(perimeter_id, home_perimeter_id) = $2
+              and coalesce(is_reserved, false) = true
+            `,
+            [companyId, perimeterId]
+        ),
+        client.query<{ cnt: string }>(
+            `
+            select count(*)::text as cnt
+            from users
+            where company_id = $1
+              and coalesce(perimeter_id, home_perimeter_id) = $2
+              and availability_status = 'available'
+            `,
+            [companyId, perimeterId]
+        ),
+    ]);
+
+    return {
+        campaign_status: lifecycle.campaignStatus,
+        reservations_status: lifecycle.reservationsStatus,
+        reserved_users_count: Number(reservedUsersRes.rows[0]?.cnt ?? 0),
+        available_users_count: Number(availableUsersRes.rows[0]?.cnt ?? 0),
+    };
+}
+
 /**
  * GET /api/admin/campaign-status
+ * Returns lifecycle status for campaign + reservation window.
  */
 adminRouter.get("/campaign-status", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    const correlationId = (req as any).correlationId;
     try {
-        const { perimeterId } = getTenantScope(req);
-        const correlationId = (req as any).correlationId;
-        if (!perimeterId) {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
         }
-        const { rows } = await pool.query(
-            `select campaign_status from perimeters where id = $1 limit 1`,
-            [perimeterId]
-        );
-        if (!rows.length) {
+        const out = await withTx(async (client) => {
+            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
+            if (!snapshot) return null;
+            return snapshot;
+        });
+        if (!out) {
             return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
         }
-        return res.json({ ok: true, campaign_status: rows[0].campaign_status, correlationId });
+        return res.json({ ok: true, ...out, correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e) });
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
     }
 });
 
 /**
  * PATCH /api/admin/campaign-status
- * Body: { campaign_status: 'open' | 'closed' }
+ * Legacy endpoint intentionally disabled: use explicit lifecycle endpoints.
  */
 adminRouter.patch("/campaign-status", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    const correlationId = (req as any).correlationId;
+    return res.status(410).json({
+        ok: false,
+        code: "DEPRECATED_ENDPOINT",
+        error: "Use /api/admin/reservations/* and /api/admin/campaign/* endpoints",
+        correlationId,
+    });
+});
+
+/**
+ * POST /api/admin/reservations/open
+ */
+adminRouter.post("/reservations/open", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
     try {
-        const { perimeterId } = getTenantScope(req);
-        if (!perimeterId) {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
         }
-        const newStatus = req.body?.campaign_status;
-        if (newStatus !== "open" && newStatus !== "closed") {
-            return res.status(400).json({ ok: false, error: "campaign_status must be 'open' or 'closed'", correlationId });
-        }
-        const { rows } = await pool.query(
-            `update perimeters set campaign_status = $1 where id = $2 returning campaign_status`,
-            [newStatus, perimeterId]
-        );
-        if (!rows.length) {
+
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) return { missingPerimeter: true as const };
+
+            const invalid = validateOpenReservations(lifecycle);
+            if (invalid) return { invalid } as const;
+
+            await client.query(
+                `update perimeters set reservations_status = 'open' where id = $1`,
+                [perimeterId]
+            );
+
+            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
+            return { snapshot };
+        });
+
+        if ("missingPerimeter" in out) {
             return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
         }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
         invalidateMapCache();
-        await audit("admin_update_campaign_status", r.user.id, { perimeterId }, { campaign_status: newStatus }, correlationId);
-        return res.json({ ok: true, campaign_status: rows[0].campaign_status, correlationId });
+        await audit("admin_open_reservations", r.user.id, { perimeterId }, out.snapshot, correlationId);
+        return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+    }
+});
+
+/**
+ * POST /api/admin/reservations/close
+ */
+adminRouter.post("/reservations/close", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) return { missingPerimeter: true as const };
+
+            const invalid = validateCloseReservations(lifecycle);
+            if (invalid) return { invalid } as const;
+
+            await client.query(
+                `update perimeters set reservations_status = 'closed' where id = $1`,
+                [perimeterId]
+            );
+
+            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
+            return { snapshot };
+        });
+
+        if ("missingPerimeter" in out) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
+        invalidateMapCache();
+        await audit("admin_close_reservations", r.user.id, { perimeterId }, out.snapshot, correlationId);
+        return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+    }
+});
+
+/**
+ * POST /api/admin/campaign/open
+ */
+adminRouter.post("/campaign/open", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) return { missingPerimeter: true as const };
+
+            const invalid = validateOpenCampaign(lifecycle);
+            if (invalid) return { invalid } as const;
+
+            await client.query(
+                `update perimeters set campaign_status = 'open' where id = $1`,
+                [perimeterId]
+            );
+
+            const usersUpdate = await client.query(
+                `
+                update users
+                set availability_status = case when coalesce(is_reserved, false) then 'available' else 'inactive' end,
+                    show_position = case when coalesce(is_reserved, false) then true else false end
+                where company_id = $1
+                  and coalesce(perimeter_id, home_perimeter_id) = $2
+                `,
+                [companyId, perimeterId]
+            );
+
+            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
+            return { snapshot, usersUpdated: usersUpdate.rowCount ?? 0 };
+        });
+
+        if ("missingPerimeter" in out) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
+        invalidateMapCache();
+        await audit(
+            "admin_open_campaign",
+            r.user.id,
+            { perimeterId },
+            { ...(out.snapshot ?? {}), usersUpdated: out.usersUpdated },
+            correlationId
+        );
+        return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
+    } catch (e: any) {
+        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+    }
+});
+
+/**
+ * POST /api/admin/campaign/close
+ */
+adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
+    const r = req as unknown as AuthedRequest;
+    const correlationId = (req as any).correlationId;
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const out = await withTx(async (client) => {
+            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+            if (!lifecycle) return { missingPerimeter: true as const };
+
+            const invalid = validateCloseCampaign(lifecycle);
+            if (invalid) return { invalid } as const;
+
+            await client.query(
+                `update perimeters
+                 set campaign_status = 'closed',
+                     reservations_status = 'closed'
+                 where id = $1`,
+                [perimeterId]
+            );
+
+            const deletedApplications = await client.query(
+                `delete from applications where company_id = $1 and perimeter_id = $2`,
+                [companyId, perimeterId]
+            );
+
+            const usersReset = await client.query(
+                `
+                update users
+                set availability_status = 'inactive',
+                    is_reserved = false,
+                    show_position = false,
+                    application_count = 0
+                where company_id = $1
+                  and coalesce(perimeter_id, home_perimeter_id) = $2
+                `,
+                [companyId, perimeterId]
+            );
+
+            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
+            return {
+                snapshot,
+                usersReset: usersReset.rowCount ?? 0,
+                applicationsDeleted: deletedApplications.rowCount ?? 0,
+            };
+        });
+
+        if ("missingPerimeter" in out) {
+            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+        }
+        if ("invalid" in out && out.invalid) {
+            const invalid = out.invalid;
+            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+        }
+
+        invalidateMapCache();
+        await audit(
+            "admin_close_campaign",
+            r.user.id,
+            { perimeterId },
+            {
+                ...(out.snapshot ?? {}),
+                usersReset: out.usersReset,
+                applicationsDeleted: out.applicationsDeleted,
+            },
+            correlationId
+        );
+        return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
     } catch (e: any) {
         return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
     }
@@ -1169,6 +1406,12 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
         u.full_name,
         u.email,
         u.availability_status,
+        u.is_reserved,
+        case
+          when u.availability_status = 'available' then 'available'
+          when coalesce(u.is_reserved, false) then 'reserved'
+          else 'inactive'
+        end as user_state,
         u.location_id,
         l.name as location_name,
         u.fixed_location,
@@ -1666,10 +1909,12 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
         };
 
         if (availability_status !== undefined) {
-            if (availability_status !== "available" && availability_status !== "inactive") {
-                return res.status(400).json({ ok: false, error: "invalid availability_status", correlationId });
-            }
-            push("availability_status", availability_status);
+            return res.status(409).json({
+                ok: false,
+                code: "MANUAL_AVAILABILITY_DISABLED",
+                error: "availability_status is lifecycle-managed and cannot be patched manually",
+                correlationId,
+            });
         }
 
         if (location_id !== undefined) push("location_id", location_id || null);

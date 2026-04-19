@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin, pool } from "../db.js";
+import { deriveUserState } from "../services/campaignLifecycle.js";
 
 export const mapRouter = Router();
 // --- Simple in-memory cache (product-lite) ---
@@ -81,7 +82,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
     }
 
     try {
-        // 1) app_config + campaign_status (parallel)
+        // 1) app_config + campaign/reservation statuses (parallel)
         const [{ data: config, error: configErr }, perimeterRes] = await Promise.all([
             supabaseAdmin
                 .from("app_config")
@@ -90,13 +91,15 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 .eq("perimeter_id", access.currentPerimeterId)
                 .single(),
             pool.query(
-                `select campaign_status from perimeters where id = $1 limit 1`,
+                `select campaign_status, reservations_status from perimeters where id = $1 limit 1`,
                 [access.currentPerimeterId]
             ),
         ]);
         if (configErr) throw configErr;
         const campaignStatus: "open" | "closed" =
             perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
+        const reservationsStatus: "open" | "closed" =
+            perimeterRes.rows[0]?.reservations_status === "open" ? "open" : "closed";
 
         // 2) viewer user (status + coords via locations)
         const { data: me, error: meErr } = await supabaseAdmin
@@ -106,6 +109,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         id,
         role_id,
         availability_status,
+        is_reserved,
         location_id,
         locations:location_id (
           latitude,
@@ -359,10 +363,15 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             viewerRoleId: me?.role_id ?? null,
             viewerLocationId: me?.location_id ?? null,
             campaign_status: campaignStatus,
-            myStatus:
-                (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
-                    ? "available"
-                    : "inactive",
+            reservations_status: reservationsStatus,
+            user_state: deriveUserState({
+                availabilityStatus: (me as any)?.availability_status ?? "inactive",
+                isReserved: (me as any)?.is_reserved ?? false,
+            }),
+            myStatus: deriveUserState({
+                availabilityStatus: (me as any)?.availability_status ?? "inactive",
+                isReserved: (me as any)?.is_reserved ?? false,
+            }),
             companyId: access.currentCompanyId,
             companyName: access.currentCompanyName,
             perimeterId: access.currentPerimeterId,
