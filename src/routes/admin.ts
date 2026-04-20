@@ -612,8 +612,12 @@ adminRouter.delete("/gdpr/users/:userId", async (req: Request, res: Response) =>
     }
 });
 
-// Harness-only namespace: all /api/admin/test-scenarios/* endpoints are dev/staging only.
+// Harness guard for test-scenarios namespace.
+// Read-only GET routes (list scenarios, list applications) are safe to expose to perimeter admins
+// regardless of harness status — they never mutate data.
+// Destructive routes (initialize, create, delete, bulk-delete) require ENABLE_HARNESS_ENDPOINTS.
 adminRouter.use("/test-scenarios", (req, res, next) => {
+    if (req.method === "GET") return next();
     if (harnessOnly(req, res)) return;
     next();
 });
