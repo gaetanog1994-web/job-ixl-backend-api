@@ -636,30 +636,36 @@ adminRouter.post(
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
 
         try {
             const result = await withTx(async (client) => {
-                const rows = await client.query(
-                    `
-            select user_id, position_id, priority
-            from test_scenario_applications
-            where scenario_id = $1
-              and company_id = $2
-              and perimeter_id = $3
-        `,
-                    [scenarioId, companyId, perimeterId]
-                );
+                const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
+                if (!lifecycle) return { missingPerimeter: true as const };
+                if (lifecycle.campaignStatus !== "open") {
+                    return {
+                        invalid: {
+                            status: 409,
+                            code: "CAMPAIGN_NOT_OPEN",
+                            message: "Impossibile inizializzare uno scenario se la campagna non è aperta.",
+                        },
+                    } as const;
+                }
 
                 await client.query(`
                     update users
                     set availability_status = 'inactive',
+                        is_reserved = false,
+                        show_position = false,
                         application_count = 0
                     where company_id = $1
                       and coalesce(perimeter_id, home_perimeter_id) = $2
                 `, [companyId, perimeterId]);
                 await client.query(`delete from applications where company_id = $1 and perimeter_id = $2`, [companyId, perimeterId]);
 
-                await client.query(
+                const insertedApplications = await client.query(
                     `
             insert into applications (user_id, position_id, priority, company_id, perimeter_id)
             select user_id, position_id, priority, company_id, perimeter_id
@@ -671,10 +677,12 @@ adminRouter.post(
                     [scenarioId, companyId, perimeterId]
                 );
 
-                await client.query(
+                const forcedAvailable = await client.query(
                     `
                   update users
-                  set availability_status = 'available'
+                  set availability_status = 'available',
+                      is_reserved = true,
+                      show_position = true
                   where id in (
                 select distinct user_id
                 from test_scenario_applications
@@ -692,6 +700,8 @@ adminRouter.post(
                   and tsa.perimeter_id = $3
                   and p.occupied_by is not null
                   )
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
                   `,
                     [scenarioId, companyId, perimeterId]
                 );
@@ -723,10 +733,22 @@ adminRouter.post(
                 `, [companyId, perimeterId]);
 
                 return {
-                    insertedApplications: rows.rowCount,
-                    activatedUsers: rows.rowCount,
+                    insertedApplications: insertedApplications.rowCount ?? 0,
+                    activatedUsers: forcedAvailable.rowCount ?? 0,
                 };
             });
+
+            if ("missingPerimeter" in result) {
+                return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
+            }
+            if ("invalid" in result && result.invalid) {
+                return res.status(result.invalid.status).json({
+                    ok: false,
+                    code: result.invalid.code,
+                    error: result.invalid.message,
+                    correlationId,
+                });
+            }
 
             invalidateMapCache();
 
@@ -1057,7 +1079,10 @@ async function readLifecycleSnapshot(client: import("pg").PoolClient, companyId:
             from users
             where company_id = $1
               and coalesce(perimeter_id, home_perimeter_id) = $2
-              and coalesce(is_reserved, false) = true
+              and (
+                coalesce(is_reserved, false) = true
+                or availability_status = 'available'
+              )
             `,
             [companyId, perimeterId]
         ),
@@ -1391,6 +1416,79 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
         return res.json({
             ok: true,
             applications: rows,
+            correlationId: (req as any).correlationId ?? null,
+        });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.get("/candidatures/stats", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        const { rows } = await pool.query<{
+            reserved_count: number;
+            active_users_count: number;
+            active_users_pct: number;
+            avg_applications_per_reserved: number;
+        }>(
+            `
+            with reserved_users as (
+                select u.id
+                from users u
+                where u.company_id = $1
+                  and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+                  and (
+                    coalesce(u.is_reserved, false) = true
+                    or u.availability_status = 'available'
+                  )
+            ),
+            applications_by_user as (
+                select a.user_id, count(*)::int as applications_count
+                from applications a
+                where a.company_id = $1
+                  and a.perimeter_id = $2
+                group by a.user_id
+            ),
+            aggregates as (
+                select
+                    count(*)::int as reserved_count,
+                    count(*) filter (where coalesce(abu.applications_count, 0) > 0)::int as active_users_count,
+                    coalesce(sum(coalesce(abu.applications_count, 0)), 0)::numeric as total_applications
+                from reserved_users ru
+                left join applications_by_user abu on abu.user_id = ru.id
+            )
+            select
+                reserved_count,
+                active_users_count,
+                case
+                    when reserved_count > 0
+                        then round((active_users_count::numeric * 100.0) / reserved_count, 1)
+                    else 0::numeric
+                end as active_users_pct,
+                case
+                    when reserved_count > 0
+                        then round(total_applications / reserved_count, 1)
+                    else 0::numeric
+                end as avg_applications_per_reserved
+            from aggregates
+            `,
+            [companyId, perimeterId]
+        );
+
+        const stats = rows[0] ?? {
+            reserved_count: 0,
+            active_users_count: 0,
+            active_users_pct: 0,
+            avg_applications_per_reserved: 0,
+        };
+
+        return res.json({
+            ok: true,
+            reserved_count: Number(stats.reserved_count ?? 0),
+            active_users_count: Number(stats.active_users_count ?? 0),
+            active_users_pct: Number(stats.active_users_pct ?? 0),
+            avg_applications_per_reserved: Number(stats.avg_applications_per_reserved ?? 0),
             correlationId: (req as any).correlationId ?? null,
         });
     } catch (e) {
