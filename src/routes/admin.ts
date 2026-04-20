@@ -618,6 +618,8 @@ adminRouter.delete("/gdpr/users/:userId", async (req: Request, res: Response) =>
 // Destructive routes (initialize, create, delete, bulk-delete) require ENABLE_HARNESS_ENDPOINTS.
 adminRouter.use("/test-scenarios", (req, res, next) => {
     if (req.method === "GET") return next();
+    // Scenario initialization is now an operational flow (not a dev-only harness action).
+    if (req.method === "POST" && /^\/[^/]+\/initialize\/?$/.test(req.path)) return next();
     if (harnessOnly(req, res)) return;
     next();
 });
@@ -631,7 +633,6 @@ adminRouter.use("/test-scenarios", requireOperationalPerimeterAdmin);
 adminRouter.post(
     "/test-scenarios/:id/initialize",
     async (req: Request, res: Response) => {
-        if (harnessOnly(req, res)) return;
         const r = req as unknown as AuthedRequest;
         const scenarioId = req.params.id;
         const correlationId = (req as any).correlationId;
