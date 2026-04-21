@@ -612,18 +612,22 @@ adminRouter.delete("/gdpr/users/:userId", async (req: Request, res: Response) =>
     }
 });
 
-// Harness guard for test-scenarios namespace.
-// Read-only GET routes (list scenarios, list applications) are safe to expose to perimeter admins
-// regardless of harness status — they never mutate data.
-// Destructive routes (initialize, create, delete, bulk-delete) require ENABLE_HARNESS_ENDPOINTS.
+// Harness guard + operational admin gate for test-scenarios namespace.
+// GET routes: skip both harness guard and requireOperationalPerimeterAdmin.
+//   requireAdmin at adminApi level already enforces canManagePerimeter.
+//   Owners/super-admins without direct perimeter_memberships pass requireAdmin but
+//   would fail requireOperationalPerimeterAdmin → silent 403 → 0 results in UI.
+// POST /:id/initialize: operational flow (not harness-only), requires operational admin.
+// All other mutating routes: harness-only in prod, also require operational admin.
 adminRouter.use("/test-scenarios", (req, res, next) => {
     if (req.method === "GET") return next();
     // Scenario initialization is now an operational flow (not a dev-only harness action).
-    if (req.method === "POST" && /^\/[^/]+\/initialize\/?$/.test(req.path)) return next();
+    if (req.method === "POST" && /^\/[^/]+\/initialize\/?$/.test(req.path)) {
+        return requireOperationalPerimeterAdmin(req, res, next);
+    }
     if (harnessOnly(req, res)) return;
-    next();
+    requireOperationalPerimeterAdmin(req, res, next);
 });
-adminRouter.use("/test-scenarios", requireOperationalPerimeterAdmin);
 
 /**
  * POST /api/admin/test-scenarios/:id/initialize
