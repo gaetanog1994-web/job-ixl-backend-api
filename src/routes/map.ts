@@ -102,6 +102,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             perimeterRes.rows[0]?.reservations_status === "open" ? "open" : "closed";
 
         // 2) viewer user (status + coords via locations)
+        // No company/perimeter filter: user uniquely identified by id; tenant scope enforced by middleware.
+        // Filtering by perimeter_id breaks users whose users.perimeter_id doesn't match the active context.
         const { data: me, error: meErr } = await supabaseAdmin
             .from("users")
             .select(
@@ -118,8 +120,6 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
       `
             )
             .eq("id", viewerUserId)
-            .eq("company_id", access.currentCompanyId)
-            .eq("perimeter_id", access.currentPerimeterId)
             .single();
         if (meErr) throw meErr;
 

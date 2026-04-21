@@ -115,8 +115,6 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
        left join companies c on c.id = $2
        left join perimeters p on p.id = $3
        where u.id = $1
-        and u.company_id = $2
-        and coalesce(u.perimeter_id, u.home_perimeter_id) = $3
        limit 1`,
             [userId, access?.currentCompanyId ?? null, access?.currentPerimeterId ?? null]
         );
