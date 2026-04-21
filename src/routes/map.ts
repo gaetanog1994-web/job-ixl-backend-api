@@ -83,19 +83,19 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
     try {
         // 1) app_config + campaign/reservation statuses (parallel)
-        const [{ data: config, error: configErr }, perimeterRes] = await Promise.all([
-            supabaseAdmin
-                .from("app_config")
-                .select("max_applications")
-                .eq("company_id", access.currentCompanyId)
-                .eq("perimeter_id", access.currentPerimeterId)
-                .single(),
+        // Use pool.query for app_config — supabase .single() throws PGRST116 when no row exists
+        // for perimeters created after the phase2 backfill (platform.ts didn't upsert app_config).
+        const [configRes, perimeterRes] = await Promise.all([
+            pool.query(
+                `select max_applications from app_config where singleton = true and company_id = $1 and perimeter_id = $2 limit 1`,
+                [access.currentCompanyId, access.currentPerimeterId]
+            ),
             pool.query(
                 `select campaign_status, reservations_status from perimeters where id = $1 limit 1`,
                 [access.currentPerimeterId]
             ),
         ]);
-        if (configErr) throw configErr;
+        const config = configRes.rows[0] ?? null;
         const campaignStatus: "open" | "closed" =
             perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
         const reservationsStatus: "open" | "closed" =
@@ -377,7 +377,7 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             perimeterId: access.currentPerimeterId,
             perimeterName: access.currentPerimeterName,
             meLocation: lat != null && lng != null ? { latitude: lat + OFFSET, longitude: lng + OFFSET } : null,
-            maxApplications: config.max_applications,
+            maxApplications: config?.max_applications ?? 3,
             usedPriorities: Array.from(new Set(usedPriorities)),
             locations,
         };

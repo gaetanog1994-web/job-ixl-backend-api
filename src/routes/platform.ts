@@ -383,6 +383,14 @@ platformRouter.post("/companies/:companyId/perimeters", requireCompanyAdmin, asy
         );
 
         const perimeter = rows[0];
+
+        await pool.query(
+            `insert into app_config (singleton, max_applications, company_id, perimeter_id)
+             values (true, 3, $1, $2)
+             on conflict (company_id, perimeter_id, singleton) do nothing`,
+            [companyId, perimeter.id]
+        );
+
         await audit("company_create_perimeter", r.user.id, { companyId, name }, { perimeter }, correlationId);
         return res.status(201).json({ ok: true, perimeter, correlationId });
     } catch (error) {
