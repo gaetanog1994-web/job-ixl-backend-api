@@ -1516,6 +1516,7 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
         u.role_id,
         r.name as role_name,
         pm.access_role,
+        u.application_count,
         u.company_id,
         u.home_perimeter_id
       from perimeter_memberships pm
@@ -1560,24 +1561,10 @@ adminRouter.get("/users/import-template", requireOperationalPerimeterAdmin, asyn
 
         const [rolesRes, locationsRes] = await Promise.all([
             pool.query<{ name: string }>(
-                `
-                select name
-                from roles
-                where company_id = $1
-                  and perimeter_id = $2
-                order by name asc
-                `,
-                [companyId, perimeterId]
+                `select name from roles order by name asc`
             ),
             pool.query<{ name: string }>(
-                `
-                select name
-                from locations
-                where company_id = $1
-                  and perimeter_id = $2
-                order by name asc
-                `,
-                [companyId, perimeterId]
+                `select name from locations order by name asc`
             ),
         ]);
 
