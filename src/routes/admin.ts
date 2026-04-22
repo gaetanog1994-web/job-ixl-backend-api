@@ -631,8 +631,9 @@ adminRouter.use("/test-scenarios", (req, res, next) => {
 
 /**
  * POST /api/admin/test-scenarios/:id/initialize
- * HARNESS ONLY — dev/staging. Destructively overwrites live application data
- * with the contents of a test scenario. Not available in production.
+ * Additive: sets scenario users to available and inserts scenario applications
+ * on top of the current state. Does NOT reset or delete existing users/applications.
+ * Requires campaign_status='open'.
  */
 adminRouter.post(
     "/test-scenarios/:id/initialize",
@@ -659,17 +660,6 @@ adminRouter.post(
                     } as const;
                 }
 
-                await client.query(`
-                    update users
-                    set availability_status = 'inactive',
-                        is_reserved = false,
-                        show_position = false,
-                        application_count = 0
-                    where company_id = $1
-                      and coalesce(perimeter_id, home_perimeter_id) = $2
-                `, [companyId, perimeterId]);
-                await client.query(`delete from applications where company_id = $1 and perimeter_id = $2`, [companyId, perimeterId]);
-
                 const insertedApplications = await client.query(
                     `
             insert into applications (user_id, position_id, priority, company_id, perimeter_id)
@@ -678,6 +668,7 @@ adminRouter.post(
             where scenario_id = $1
               and company_id = $2
               and perimeter_id = $3
+            on conflict (user_id, position_id) do nothing
         `,
                     [scenarioId, companyId, perimeterId]
                 );
