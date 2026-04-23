@@ -7,10 +7,11 @@ export type OccupantGroupRow = {
   id: string;
   role_id: string | null;
   location_id: string | null;
+  department_id: string | null;
 };
 
 /**
- * Counts distinct logical groups (role_id, location_id) for a set of targeted positions.
+ * Counts distinct logical groups (role_id, location_id, department_id) for targeted positions.
  *
  * A logical group corresponds to the current occupant profile of each targeted position.
  * Missing positions/occupants are ignored.
@@ -38,7 +39,7 @@ export function countDistinctGroups(params: {
     const occupant = occupantsById.get(position.occupied_by);
     if (!occupant) continue;
 
-    groups.add(`${occupant.role_id}__${occupant.location_id}`);
+    groups.add(`${occupant.role_id}__${occupant.location_id}__${occupant.department_id}`);
   }
 
   return groups.size;

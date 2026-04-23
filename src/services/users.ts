@@ -27,7 +27,7 @@ export interface DeactivateResult {
  * 3. Delete incoming applications (others applied to the position this user occupies).
  * 4. Set the user as inactive (+ optionally hide from map).
  * 5. Recalculate application_count for all affected users using distinct
- *    (role_id, location_id) group logic — same as countDistinctGroups() in backend.
+ *    (role_id, location_id, department_id) group logic — same as countDistinctGroups().
  *
  * Replaces: Supabase function deactivate_user_and_cleanup()
  * Caller must call invalidateMapCache() after this function returns.
@@ -100,7 +100,7 @@ export async function deactivateUserAndCleanup(
         );
 
         // ── Step 5: recalculate application_count for affected users ──────────
-        // Uses distinct (role_id, location_id) group logic matching countDistinctGroups().
+        // Uses distinct (role_id, location_id, department_id) group logic matching countDistinctGroups().
         let recalculatedCount = 0;
         if (affectedUserIds.length > 0) {
             // Update users who still have applications: recalculate count
@@ -109,7 +109,7 @@ export async function deactivateUserAndCleanup(
                  SET    application_count = coalesce(x.cnt, 0)
                  FROM (
                      SELECT a.user_id,
-                            count(DISTINCT (uo.role_id, uo.location_id))::int AS cnt
+                            count(DISTINCT (uo.role_id, uo.location_id, uo.department_id))::int AS cnt
                      FROM   applications a
                      JOIN   positions    p   ON p.id  = a.position_id
                      JOIN   users        uo  ON uo.id = p.occupied_by

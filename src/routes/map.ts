@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { requireAuth, type AuthedRequest } from "../auth.js";
 import { supabaseAdmin, pool } from "../db.js";
-import { deriveUserState } from "../services/campaignLifecycle.js";
+import { deriveUserState, getCampaignStatus } from "../services/campaignLifecycle.js";
 
 export const mapRouter = Router();
 // --- Simple in-memory cache (product-lite) ---
@@ -85,21 +85,16 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         // 1) app_config + campaign/reservation statuses (parallel)
         // Use pool.query for app_config — supabase .single() throws PGRST116 when no row exists
         // for perimeters created after the phase2 backfill (platform.ts didn't upsert app_config).
-        const [configRes, perimeterRes] = await Promise.all([
+        const [configRes, campaignStatusRes] = await Promise.all([
             pool.query(
                 `select max_applications from app_config where singleton = true and company_id = $1 and perimeter_id = $2 limit 1`,
                 [access.currentCompanyId, access.currentPerimeterId]
             ),
-            pool.query(
-                `select campaign_status, reservations_status from perimeters where id = $1 limit 1`,
-                [access.currentPerimeterId]
-            ),
+            getCampaignStatus(access.currentCompanyId, access.currentPerimeterId),
         ]);
         const config = configRes.rows[0] ?? null;
-        const campaignStatus: "open" | "closed" =
-            perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
-        const reservationsStatus: "open" | "closed" =
-            perimeterRes.rows[0]?.reservations_status === "open" ? "open" : "closed";
+        const campaignStatus = campaignStatusRes.campaign_status;
+        const reservationsStatus = campaignStatusRes.reservations_status;
 
         // 2) viewer user (status + coords via locations)
         // No company/perimeter filter: user uniquely identified by id; tenant scope enforced by middleware.
@@ -236,6 +231,10 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         roles:role_id (
           name
         ),
+        department_id,
+        departments:department_id (
+          name
+        ),
         location_id,
         locations:location_id (
           id,
@@ -264,8 +263,11 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 roles: Record<
                     string,
                     {
+                        group_key: string;
                         role_id: string;
                         role_name: string;
+                        department_id: string | null;
+                        department_name: string | null;
                         fixed_location: boolean;
                         applied: boolean;
                         priority: number | null;
@@ -291,6 +293,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
             const roleId = (u as any).role_id ?? "unknown";
             const roleName = (u as any).roles?.name ?? "—";
+            const departmentId = (u as any).department_id ?? null;
+            const departmentObj = Array.isArray((u as any).departments)
+                ? (u as any).departments[0]
+                : (u as any).departments;
+            const departmentName = departmentObj?.name ?? null;
+            const groupKey = `${roleId}__${departmentId ?? "null"}`;
 
             // Regola business: nascondi posizioni con stesso ruolo + stessa sede del viewer.
             if (
@@ -314,10 +322,13 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
             const isFixed = !!(u as any).fixed_location;
 
-            if (!byLocation[loc.id].roles[roleId]) {
-                byLocation[loc.id].roles[roleId] = {
+            if (!byLocation[loc.id].roles[groupKey]) {
+                byLocation[loc.id].roles[groupKey] = {
+                    group_key: groupKey,
                     role_id: roleId,
                     role_name: roleName,
+                    department_id: departmentId,
+                    department_name: departmentName,
                     fixed_location: isFixed,
                     applied: false,
                     priority: null,
@@ -325,10 +336,10 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 };
             } else {
                 // role is fixed if ANY occupant has fixed_location = true
-                if (isFixed) byLocation[loc.id].roles[roleId].fixed_location = true;
+                if (isFixed) byLocation[loc.id].roles[groupKey].fixed_location = true;
             }
 
-            byLocation[loc.id].roles[roleId].users.push({
+            byLocation[loc.id].roles[groupKey].users.push({
                 id: u.id,
                 full_name: u.full_name,
                 position_id: positionId, // ✅ SEMPRE positions.id
@@ -336,12 +347,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
             // applied/priority coerenti col mode (relatedUserIds contiene user_id)
             if (relatedUserIds.includes(u.id)) {
-                byLocation[loc.id].roles[roleId].applied = true;
+                byLocation[loc.id].roles[groupKey].applied = true;
 
                 const pBest = userPriorityMap[u.id];
                 if (pBest != null) {
-                    const prev = byLocation[loc.id].roles[roleId].priority;
-                    byLocation[loc.id].roles[roleId].priority = prev == null ? pBest : Math.min(prev, pBest);
+                    const prev = byLocation[loc.id].roles[groupKey].priority;
+                    byLocation[loc.id].roles[groupKey].priority = prev == null ? pBest : Math.min(prev, pBest);
                 }
             }
         }

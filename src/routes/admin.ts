@@ -12,11 +12,12 @@ import { requireOperationalPerimeterAdmin } from "../tenant.js";
 import { normalizeEmailInput, resolveAuthUserByEmail } from "../services/authUsers.js";
 import {
     deriveUserState,
-    loadPerimeterLifecycle,
-    validateCloseCampaign,
-    validateCloseReservations,
-    validateOpenCampaign,
-    validateOpenReservations,
+    loadCampaignLifecycle,
+    getCampaignStatus,
+    openReservations,
+    closeReservations,
+    openCampaign,
+    closeCampaign,
 } from "../services/campaignLifecycle.js";
 
 export const adminRouter = Router();
@@ -648,8 +649,7 @@ adminRouter.post(
 
         try {
             const result = await withTx(async (client) => {
-                const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
-                if (!lifecycle) return { missingPerimeter: true as const };
+                const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
                 if (lifecycle.campaignStatus !== "open") {
                     return {
                         invalid: {
@@ -734,9 +734,6 @@ adminRouter.post(
                 };
             });
 
-            if ("missingPerimeter" in result) {
-                return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-            }
             if ("invalid" in result && result.invalid) {
                 return res.status(result.invalid.status).json({
                     ok: false,
@@ -1065,8 +1062,7 @@ adminRouter.post("/users/reset-active", async (req: Request, res: Response) => {
 });
 
 async function readLifecycleSnapshot(client: import("pg").PoolClient, companyId: string, perimeterId: string) {
-    const lifecycle = await loadPerimeterLifecycle(client, perimeterId);
-    if (!lifecycle) return null;
+    const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId);
 
     const [reservedUsersRes, availableUsersRes] = await Promise.all([
         client.query<{ cnt: string }>(
@@ -1097,6 +1093,7 @@ async function readLifecycleSnapshot(client: import("pg").PoolClient, companyId:
     return {
         campaign_status: lifecycle.campaignStatus,
         reservations_status: lifecycle.reservationsStatus,
+        campaign_id: lifecycle.campaignId,
         reserved_users_count: Number(reservedUsersRes.rows[0]?.cnt ?? 0),
         available_users_count: Number(availableUsersRes.rows[0]?.cnt ?? 0),
     };
@@ -1114,13 +1111,8 @@ adminRouter.get("/campaign-status", requireOperationalPerimeterAdmin, async (req
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
         }
         const out = await withTx(async (client) => {
-            const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
-            if (!snapshot) return null;
-            return snapshot;
+            return readLifecycleSnapshot(client, companyId, perimeterId);
         });
-        if (!out) {
-            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-        }
         return res.json({ ok: true, ...out, correlationId });
     } catch (e: any) {
         return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
@@ -1154,24 +1146,12 @@ adminRouter.post("/reservations/open", requireOperationalPerimeterAdmin, async (
         }
 
         const out = await withTx(async (client) => {
-            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
-            if (!lifecycle) return { missingPerimeter: true as const };
-
-            const invalid = validateOpenReservations(lifecycle);
-            if (invalid) return { invalid } as const;
-
-            await client.query(
-                `update perimeters set reservations_status = 'open' where id = $1`,
-                [perimeterId]
-            );
-
+            const result = await openReservations(client, companyId, perimeterId);
+            if ("error" in result) return { invalid: result.error };
             const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
             return { snapshot };
         });
 
-        if ("missingPerimeter" in out) {
-            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-        }
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
@@ -1198,24 +1178,12 @@ adminRouter.post("/reservations/close", requireOperationalPerimeterAdmin, async 
         }
 
         const out = await withTx(async (client) => {
-            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
-            if (!lifecycle) return { missingPerimeter: true as const };
-
-            const invalid = validateCloseReservations(lifecycle);
-            if (invalid) return { invalid } as const;
-
-            await client.query(
-                `update perimeters set reservations_status = 'closed' where id = $1`,
-                [perimeterId]
-            );
-
+            const result = await closeReservations(client, companyId, perimeterId);
+            if ("error" in result) return { invalid: result.error };
             const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
             return { snapshot };
         });
 
-        if ("missingPerimeter" in out) {
-            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-        }
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
@@ -1242,35 +1210,12 @@ adminRouter.post("/campaign/open", requireOperationalPerimeterAdmin, async (req:
         }
 
         const out = await withTx(async (client) => {
-            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
-            if (!lifecycle) return { missingPerimeter: true as const };
-
-            const invalid = validateOpenCampaign(lifecycle);
-            if (invalid) return { invalid } as const;
-
-            await client.query(
-                `update perimeters set campaign_status = 'open' where id = $1`,
-                [perimeterId]
-            );
-
-            const usersUpdate = await client.query(
-                `
-                update users
-                set availability_status = case when coalesce(is_reserved, false) then 'available' else 'inactive' end,
-                    show_position = case when coalesce(is_reserved, false) then true else false end
-                where company_id = $1
-                  and coalesce(perimeter_id, home_perimeter_id) = $2
-                `,
-                [companyId, perimeterId]
-            );
-
+            const result = await openCampaign(client, companyId, perimeterId);
+            if ("error" in result) return { invalid: result.error };
             const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
-            return { snapshot, usersUpdated: usersUpdate.rowCount ?? 0 };
+            return { snapshot, usersUpdated: result.usersUpdated };
         });
 
-        if ("missingPerimeter" in out) {
-            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-        }
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
@@ -1303,49 +1248,16 @@ adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req
         }
 
         const out = await withTx(async (client) => {
-            const lifecycle = await loadPerimeterLifecycle(client, perimeterId, { forUpdate: true });
-            if (!lifecycle) return { missingPerimeter: true as const };
-
-            const invalid = validateCloseCampaign(lifecycle);
-            if (invalid) return { invalid } as const;
-
-            await client.query(
-                `update perimeters
-                 set campaign_status = 'closed',
-                     reservations_status = 'closed'
-                 where id = $1`,
-                [perimeterId]
-            );
-
-            const deletedApplications = await client.query(
-                `delete from applications where company_id = $1 and perimeter_id = $2`,
-                [companyId, perimeterId]
-            );
-
-            const usersReset = await client.query(
-                `
-                update users
-                set availability_status = 'inactive',
-                    is_reserved = false,
-                    show_position = false,
-                    application_count = 0
-                where company_id = $1
-                  and coalesce(perimeter_id, home_perimeter_id) = $2
-                `,
-                [companyId, perimeterId]
-            );
-
+            const result = await closeCampaign(client, companyId, perimeterId);
+            if ("error" in result) return { invalid: result.error };
             const snapshot = await readLifecycleSnapshot(client, companyId, perimeterId);
             return {
                 snapshot,
-                usersReset: usersReset.rowCount ?? 0,
-                applicationsDeleted: deletedApplications.rowCount ?? 0,
+                usersReset: result.usersReset,
+                applicationsDeleted: result.applicationsDeleted,
             };
         });
 
-        if ("missingPerimeter" in out) {
-            return res.status(404).json({ ok: false, error: "PERIMETER_NOT_FOUND", correlationId });
-        }
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
@@ -1385,7 +1297,37 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
 
         occ.full_name as occupant_full_name,
         occ_role.name as occupant_role_name,
-        occ_loc.name as occupant_location_name
+        occ_loc.name as occupant_location_name,
+        occ.department_id as target_department_id,
+        target_dpt.name as target_department_name,
+        coalesce(
+          (
+            select json_agg(
+              json_build_object('id', rsp.id, 'name', rsp.name)
+              order by rsp.name asc
+            )
+            from user_responsabile_assignments ura
+            join responsabili rsp on rsp.id = ura.responsabile_id
+            where ura.user_id = occ.id
+              and ura.company_id = $1
+              and ura.perimeter_id = $2
+          ),
+          '[]'::json
+        ) as target_responsabili,
+        coalesce(
+          (
+            select json_agg(
+              json_build_object('id', hr.id, 'name', hr.name)
+              order by hr.name asc
+            )
+            from user_hr_assignments uha
+            join hr_managers hr on hr.id = uha.hr_manager_id
+            where uha.user_id = occ.id
+              and uha.company_id = $1
+              and uha.perimeter_id = $2
+          ),
+          '[]'::json
+        ) as target_hr_managers
 
       from applications a
       join users cand on cand.id = a.user_id
@@ -1398,6 +1340,7 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
 
       left join roles occ_role on occ_role.id = occ.role_id
       left join locations occ_loc on occ_loc.id = occ.location_id
+      left join departments target_dpt on target_dpt.id = occ.department_id
 
       where a.company_id = $1
         and a.perimeter_id = $2
@@ -1422,57 +1365,60 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
 adminRouter.get("/candidatures/stats", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
-        const { rows } = await pool.query<{
-            reserved_count: number;
-            active_users_count: number;
-            active_users_pct: number;
-            avg_applications_per_reserved: number;
-        }>(
-            `
-            with reserved_users as (
-                select u.id
-                from users u
-                where u.company_id = $1
-                  and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
-                  and (
-                    coalesce(u.is_reserved, false) = true
-                    or u.availability_status = 'available'
-                  )
-            ),
-            applications_by_user as (
-                select a.user_id, count(*)::int as applications_count
-                from applications a
-                where a.company_id = $1
-                  and a.perimeter_id = $2
-                group by a.user_id
-            ),
-            aggregates as (
+        const [statsRows, campaignStatus] = await Promise.all([
+            pool.query<{
+                reserved_count: number;
+                active_users_count: number;
+                active_users_pct: number;
+                avg_applications_per_reserved: number;
+            }>(
+                `
+                with reserved_users as (
+                    select u.id
+                    from users u
+                    where u.company_id = $1
+                      and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+                      and (
+                        coalesce(u.is_reserved, false) = true
+                        or u.availability_status = 'available'
+                      )
+                ),
+                applications_by_user as (
+                    select a.user_id, count(*)::int as applications_count
+                    from applications a
+                    where a.company_id = $1
+                      and a.perimeter_id = $2
+                    group by a.user_id
+                ),
+                aggregates as (
+                    select
+                        count(*)::int as reserved_count,
+                        count(*) filter (where coalesce(abu.applications_count, 0) > 0)::int as active_users_count,
+                        coalesce(sum(coalesce(abu.applications_count, 0)), 0)::numeric as total_applications
+                    from reserved_users ru
+                    left join applications_by_user abu on abu.user_id = ru.id
+                )
                 select
-                    count(*)::int as reserved_count,
-                    count(*) filter (where coalesce(abu.applications_count, 0) > 0)::int as active_users_count,
-                    coalesce(sum(coalesce(abu.applications_count, 0)), 0)::numeric as total_applications
-                from reserved_users ru
-                left join applications_by_user abu on abu.user_id = ru.id
-            )
-            select
-                reserved_count,
-                active_users_count,
-                case
-                    when reserved_count > 0
-                        then round((active_users_count::numeric * 100.0) / reserved_count, 1)
-                    else 0::numeric
-                end as active_users_pct,
-                case
-                    when reserved_count > 0
-                        then round(total_applications / reserved_count, 1)
-                    else 0::numeric
-                end as avg_applications_per_reserved
-            from aggregates
-            `,
-            [companyId, perimeterId]
-        );
+                    reserved_count,
+                    active_users_count,
+                    case
+                        when reserved_count > 0
+                            then round((active_users_count::numeric * 100.0) / reserved_count, 1)
+                        else 0::numeric
+                    end as active_users_pct,
+                    case
+                        when reserved_count > 0
+                            then round(total_applications / reserved_count, 1)
+                        else 0::numeric
+                    end as avg_applications_per_reserved
+                from aggregates
+                `,
+                [companyId, perimeterId]
+            ),
+            getCampaignStatus(companyId, perimeterId),
+        ]);
 
-        const stats = rows[0] ?? {
+        const stats = statsRows.rows[0] ?? {
             reserved_count: 0,
             active_users_count: 0,
             active_users_pct: 0,
@@ -1481,6 +1427,9 @@ adminRouter.get("/candidatures/stats", requireOperationalPerimeterAdmin, async (
 
         return res.json({
             ok: true,
+            campaign_id: campaignStatus.campaign_id,
+            campaign_status: campaignStatus.campaign_status,
+            reservations_status: campaignStatus.reservations_status,
             reserved_count: Number(stats.reserved_count ?? 0),
             active_users_count: Number(stats.active_users_count ?? 0),
             active_users_pct: Number(stats.active_users_pct ?? 0),
@@ -1515,14 +1464,45 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
         u.fixed_location,
         u.role_id,
         r.name as role_name,
+        u.department_id,
+        dpt.name as department_name,
         pm.access_role,
         u.application_count,
+        coalesce(
+          (
+            select json_agg(
+              json_build_object('id', rsp.id, 'name', rsp.name)
+              order by rsp.name asc
+            )
+            from user_responsabile_assignments ura
+            join responsabili rsp on rsp.id = ura.responsabile_id
+            where ura.user_id = u.id
+              and ura.company_id = $1
+              and ura.perimeter_id = $2
+          ),
+          '[]'::json
+        ) as responsabili,
+        coalesce(
+          (
+            select json_agg(
+              json_build_object('id', hr.id, 'name', hr.name)
+              order by hr.name asc
+            )
+            from user_hr_assignments uha
+            join hr_managers hr on hr.id = uha.hr_manager_id
+            where uha.user_id = u.id
+              and uha.company_id = $1
+              and uha.perimeter_id = $2
+          ),
+          '[]'::json
+        ) as hr_managers,
         u.company_id,
         u.home_perimeter_id
       from perimeter_memberships pm
       join users u on u.id = pm.user_id
       left join locations l on l.id = u.location_id
       left join roles r on r.id = u.role_id
+      left join departments dpt on dpt.id = u.department_id
       where pm.company_id = $1
         and pm.perimeter_id = $2
         and u.company_id = $1
@@ -1925,7 +1905,7 @@ adminRouter.post(
     }
 );
 
-adminRouter.post("/users", async (req, res, next) => {
+adminRouter.post("/users", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
@@ -1953,7 +1933,98 @@ adminRouter.post("/users", async (req, res, next) => {
     }
 });
 
-adminRouter.delete("/users/:id", async (req, res, next) => {
+adminRouter.get("/users/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const userId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        if (!userId) {
+            return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED", correlationId });
+        }
+
+        const { rows } = await pool.query(
+            `
+            select
+              u.id,
+              u.first_name,
+              u.last_name,
+              u.full_name,
+              u.email,
+              u.availability_status,
+              u.is_reserved,
+              case
+                when u.availability_status = 'available' then 'available'
+                when coalesce(u.is_reserved, false) then 'reserved'
+                else 'inactive'
+              end as user_state,
+              u.location_id,
+              l.name as location_name,
+              u.fixed_location,
+              u.role_id,
+              r.name as role_name,
+              u.department_id,
+              dpt.name as department_name,
+              pm.access_role,
+              u.application_count,
+              coalesce(
+                (
+                  select json_agg(
+                    json_build_object('id', rsp.id, 'name', rsp.name)
+                    order by rsp.name asc
+                  )
+                  from user_responsabile_assignments ura
+                  join responsabili rsp on rsp.id = ura.responsabile_id
+                  where ura.user_id = u.id
+                    and ura.company_id = $1
+                    and ura.perimeter_id = $2
+                ),
+                '[]'::json
+              ) as responsabili,
+              coalesce(
+                (
+                  select json_agg(
+                    json_build_object('id', hr.id, 'name', hr.name)
+                    order by hr.name asc
+                  )
+                  from user_hr_assignments uha
+                  join hr_managers hr on hr.id = uha.hr_manager_id
+                  where uha.user_id = u.id
+                    and uha.company_id = $1
+                    and uha.perimeter_id = $2
+                ),
+                '[]'::json
+              ) as hr_managers
+            from perimeter_memberships pm
+            join users u on u.id = pm.user_id
+            left join locations l on l.id = u.location_id
+            left join roles r on r.id = u.role_id
+            left join departments dpt on dpt.id = u.department_id
+            where pm.company_id = $1
+              and pm.perimeter_id = $2
+              and u.company_id = $1
+              and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+              and coalesce(pm.status, 'active') = 'active'
+              and u.id = $3
+            limit 1
+            `,
+            [companyId, perimeterId, userId]
+        );
+
+        const user = rows[0] ?? null;
+        if (!user) {
+            return res.status(404).json({ ok: false, error: "USER_NOT_FOUND", correlationId });
+        }
+
+        return res.json({ ok: true, user, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.delete("/users/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
         const userId = req.params.id;
@@ -1976,13 +2047,39 @@ adminRouter.delete("/users/:id", async (req, res, next) => {
     }
 });
 
-adminRouter.patch("/users/:id", async (req, res, next) => {
+adminRouter.patch("/users/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const userId = req.params.id;
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
 
-        const { availability_status, location_id, fixed_location, role_id, access_role } = req.body ?? {};
+        const {
+            availability_status,
+            first_name,
+            last_name,
+            email,
+            role_id,
+            department_id,
+            location_id,
+            fixed_location,
+            access_role,
+        } = req.body ?? {};
+
+        const existingUserRes = await pool.query(
+            `
+            select id, first_name, last_name
+            from users
+            where id = $1
+              and company_id = $2
+              and coalesce(perimeter_id, home_perimeter_id) = $3
+            limit 1
+            `,
+            [userId, companyId, perimeterId]
+        );
+        const existingUser = existingUserRes.rows[0] ?? null;
+        if (!existingUser) {
+            return res.status(404).json({ ok: false, error: "USER_NOT_FOUND", correlationId });
+        }
 
         const fields: string[] = [];
         const values: any[] = [];
@@ -2002,9 +2099,36 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
             });
         }
 
+        const normalizeNullableText = (value: unknown): string | null => {
+            if (typeof value !== "string") return null;
+            const trimmed = value.trim();
+            return trimmed.length > 0 ? trimmed : null;
+        };
+
+        if (first_name !== undefined) {
+            push("first_name", normalizeNullableText(first_name));
+        }
+        if (last_name !== undefined) {
+            push("last_name", normalizeNullableText(last_name));
+        }
+        if (email !== undefined) {
+            const normalizedEmail = normalizeEmailInput(email);
+            if (normalizedEmail && !isValidEmailFormat(normalizedEmail)) {
+                return res.status(400).json({ ok: false, error: "invalid email format", correlationId });
+            }
+            push("email", normalizedEmail);
+        }
+        if (department_id !== undefined) push("department_id", department_id || null);
         if (location_id !== undefined) push("location_id", location_id || null);
         if (fixed_location !== undefined) push("fixed_location", !!fixed_location);
         if (role_id !== undefined) push("role_id", role_id || null);
+
+        if (first_name !== undefined || last_name !== undefined) {
+            const nextFirstName = normalizeNullableText(first_name) ?? normalizeNullableText(existingUser.first_name);
+            const nextLastName = normalizeNullableText(last_name) ?? normalizeNullableText(existingUser.last_name);
+            const nextFullName = [nextFirstName, nextLastName].filter(Boolean).join(" ").trim() || null;
+            push("full_name", nextFullName);
+        }
 
         if (fields.length === 0 && access_role === undefined) {
             return res.status(400).json({ ok: false, error: "empty patch", correlationId });
@@ -2035,7 +2159,7 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
       where id = $${i}
         and company_id = $${i + 1}
         and coalesce(perimeter_id, home_perimeter_id) = $${i + 2}
-      returning id, full_name, email, availability_status, location_id, fixed_location, role_id, company_id, perimeter_id
+      returning id, first_name, last_name, full_name, email, availability_status, location_id, fixed_location, role_id, department_id, company_id, perimeter_id
       `,
             values
         ) : { rows: [] as any[] };
@@ -2044,7 +2168,7 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
             ? rows[0]
             : (await pool.query(
                 `
-                select id, full_name, email, availability_status, location_id, fixed_location, role_id, company_id, perimeter_id
+                select id, first_name, last_name, full_name, email, availability_status, location_id, fixed_location, role_id, department_id, company_id, perimeter_id
                 from users
                 where id = $1
                   and company_id = $2
@@ -2074,6 +2198,43 @@ adminRouter.patch("/users/:id", async (req, res, next) => {
         return res.json({
             ok: true,
             user: userFromDb ? { ...userFromDb, access_role: membershipAccessRole } : null,
+            correlationId,
+        });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.patch("/users/:id/access-role", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const userId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        const accessRole = String(req.body?.access_role ?? "").trim();
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        if (!userId) {
+            return res.status(400).json({ ok: false, error: "USER_ID_REQUIRED", correlationId });
+        }
+        if (!["user", "admin", "admin_user"].includes(accessRole)) {
+            return res.status(400).json({ ok: false, error: "invalid access_role", correlationId });
+        }
+
+        const membershipResult = await pool.query(
+            `
+            insert into perimeter_memberships (user_id, company_id, perimeter_id, access_role, status)
+            values ($1, $2, $3, $4, 'active')
+            on conflict (user_id, company_id, perimeter_id)
+            do update set access_role = excluded.access_role
+            returning user_id, company_id, perimeter_id, access_role
+            `,
+            [userId, companyId, perimeterId, accessRole]
+        );
+
+        return res.json({
+            ok: true,
+            membership: membershipResult.rows[0] ?? null,
             correlationId,
         });
     } catch (e) {
@@ -2128,6 +2289,462 @@ adminRouter.get("/roles", async (req, res, next) => {
     } catch (e) {
         next(e);
     }
+});
+
+adminRouter.get("/departments", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const { rows } = await pool.query(
+            `
+            select
+              d.id,
+              d.name,
+              count(u.id)::int as assigned_users_count
+            from departments d
+            left join users u
+              on u.department_id = d.id
+             and u.company_id = $1
+             and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+            where d.company_id = $1
+              and d.perimeter_id = $2
+            group by d.id, d.name
+            order by d.name asc
+            `,
+            [companyId, perimeterId]
+        );
+
+        return res.json({ ok: true, departments: rows, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.post("/departments", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing name", correlationId });
+        }
+        const { rows } = await pool.query(
+            `
+            insert into departments (company_id, perimeter_id, name)
+            values ($1, $2, $3)
+            returning id, name
+            `,
+            [companyId, perimeterId, name]
+        );
+        return res.status(201).json({ ok: true, department: rows[0] ?? null, correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({
+                ok: false,
+                error: "DEPARTMENT_ALREADY_EXISTS",
+                message: "Esiste già un reparto con questo nome.",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+        next(e);
+    }
+});
+
+adminRouter.patch("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const departmentId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing name", correlationId });
+        }
+        const { rows } = await pool.query(
+            `
+            update departments
+            set name = $1
+            where id = $2
+              and company_id = $3
+              and perimeter_id = $4
+            returning id, name
+            `,
+            [name, departmentId, companyId, perimeterId]
+        );
+        if (!rows[0]) {
+            return res.status(404).json({ ok: false, error: "DEPARTMENT_NOT_FOUND", correlationId });
+        }
+        return res.json({ ok: true, department: rows[0], correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({
+                ok: false,
+                error: "DEPARTMENT_ALREADY_EXISTS",
+                message: "Esiste già un reparto con questo nome.",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+        next(e);
+    }
+});
+
+adminRouter.delete("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const departmentId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const assignedUsers = await pool.query(
+            `
+            select count(*)::int as users_count
+            from users
+            where department_id = $1
+              and company_id = $2
+              and coalesce(perimeter_id, home_perimeter_id) = $3
+            `,
+            [departmentId, companyId, perimeterId]
+        );
+        const usersCount = Number(assignedUsers.rows[0]?.users_count ?? 0);
+        if (usersCount > 0) {
+            return res.status(409).json({
+                ok: false,
+                error: "DEPARTMENT_HAS_USERS",
+                message: "Impossibile eliminare: ci sono utenti assegnati a questo reparto.",
+                correlationId,
+            });
+        }
+
+        const del = await pool.query(
+            `
+            delete from departments
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+            `,
+            [departmentId, companyId, perimeterId]
+        );
+        if ((del.rowCount ?? 0) === 0) {
+            return res.status(404).json({ ok: false, error: "DEPARTMENT_NOT_FOUND", correlationId });
+        }
+        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+type ManagerEntityConfig = {
+    resourcePath: "/responsabili" | "/hr-managers";
+    managerTable: "responsabili" | "hr_managers";
+    assignmentTable: "user_responsabile_assignments" | "user_hr_assignments";
+    managerIdColumn: "responsabile_id" | "hr_manager_id";
+    listProperty: "responsabili" | "hr_managers";
+};
+
+function registerManagerEntityRoutes(config: ManagerEntityConfig) {
+    const { resourcePath, managerTable, assignmentTable, managerIdColumn, listProperty } = config;
+
+    adminRouter.get(resourcePath, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            const { rows } = await pool.query(
+                `
+                select
+                  m.id,
+                  m.name,
+                  m.email,
+                  count(distinct a.user_id)::int as assigned_users_count
+                from ${managerTable} m
+                left join ${assignmentTable} a
+                  on a.${managerIdColumn} = m.id
+                 and a.company_id = $1
+                 and a.perimeter_id = $2
+                where m.company_id = $1
+                  and m.perimeter_id = $2
+                group by m.id, m.name, m.email
+                order by m.name asc
+                `,
+                [companyId, perimeterId]
+            );
+            return res.json({ ok: true, [listProperty]: rows, correlationId });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.post(resourcePath, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            const name = String(req.body?.name ?? "").trim();
+            const email = normalizeEmailInput(req.body?.email);
+            if (!name) {
+                return res.status(400).json({ ok: false, error: "missing name", correlationId });
+            }
+            if (email && !isValidEmailFormat(email)) {
+                return res.status(400).json({ ok: false, error: "invalid email format", correlationId });
+            }
+
+            const { rows } = await pool.query(
+                `
+                insert into ${managerTable} (company_id, perimeter_id, name, email)
+                values ($1, $2, $3, $4)
+                returning id, name, email
+                `,
+                [companyId, perimeterId, name, email]
+            );
+            return res.status(201).json({ ok: true, manager: rows[0] ?? null, correlationId });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.patch(`${resourcePath}/:id`, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const managerId = String(req.params.id ?? "").trim();
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            const name = String(req.body?.name ?? "").trim();
+            const email = normalizeEmailInput(req.body?.email);
+            if (!name) {
+                return res.status(400).json({ ok: false, error: "missing name", correlationId });
+            }
+            if (email && !isValidEmailFormat(email)) {
+                return res.status(400).json({ ok: false, error: "invalid email format", correlationId });
+            }
+
+            const { rows } = await pool.query(
+                `
+                update ${managerTable}
+                set name = $1,
+                    email = $2
+                where id = $3
+                  and company_id = $4
+                  and perimeter_id = $5
+                returning id, name, email
+                `,
+                [name, email, managerId, companyId, perimeterId]
+            );
+            if (!rows[0]) {
+                return res.status(404).json({ ok: false, error: "MANAGER_NOT_FOUND", correlationId });
+            }
+            return res.json({ ok: true, manager: rows[0], correlationId });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.delete(`${resourcePath}/:id`, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const managerId = String(req.params.id ?? "").trim();
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            const del = await pool.query(
+                `
+                delete from ${managerTable}
+                where id = $1
+                  and company_id = $2
+                  and perimeter_id = $3
+                `,
+                [managerId, companyId, perimeterId]
+            );
+            if ((del.rowCount ?? 0) === 0) {
+                return res.status(404).json({ ok: false, error: "MANAGER_NOT_FOUND", correlationId });
+            }
+            return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.get(`${resourcePath}/:id/users`, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const managerId = String(req.params.id ?? "").trim();
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+
+            const { rows } = await pool.query(
+                `
+                select
+                  u.id,
+                  u.first_name,
+                  u.last_name,
+                  u.full_name,
+                  u.email,
+                  u.role_id,
+                  r.name as role_name,
+                  u.department_id,
+                  dpt.name as department_name,
+                  u.location_id,
+                  l.name as location_name
+                from ${assignmentTable} a
+                join users u on u.id = a.user_id
+                left join roles r on r.id = u.role_id
+                left join departments dpt on dpt.id = u.department_id
+                left join locations l on l.id = u.location_id
+                where a.${managerIdColumn} = $1
+                  and a.company_id = $2
+                  and a.perimeter_id = $3
+                  and u.company_id = $2
+                  and coalesce(u.perimeter_id, u.home_perimeter_id) = $3
+                order by u.last_name nulls last, u.first_name nulls last, u.full_name nulls last, u.id
+                `,
+                [managerId, companyId, perimeterId]
+            );
+
+            return res.json({ ok: true, users: rows, correlationId });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.post(`${resourcePath}/:id/assign`, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const managerId = String(req.params.id ?? "").trim();
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+            const rawUserIds: unknown[] = Array.isArray(req.body?.user_ids) ? req.body.user_ids : [];
+            const userIds: string[] = Array.from(new Set(
+                rawUserIds
+                    .map((value: unknown) => String(value ?? "").trim())
+                    .filter(Boolean)
+            ));
+
+            if (userIds.length === 0) {
+                return res.status(400).json({ ok: false, error: "user_ids required", correlationId });
+            }
+
+            const managerExists = await pool.query(
+                `
+                select id
+                from ${managerTable}
+                where id = $1
+                  and company_id = $2
+                  and perimeter_id = $3
+                limit 1
+                `,
+                [managerId, companyId, perimeterId]
+            );
+            if (!managerExists.rows[0]) {
+                return res.status(404).json({ ok: false, error: "MANAGER_NOT_FOUND", correlationId });
+            }
+
+            const scopedUsers = await pool.query(
+                `
+                select id
+                from users
+                where id = any($1::uuid[])
+                  and company_id = $2
+                  and coalesce(perimeter_id, home_perimeter_id) = $3
+                `,
+                [userIds, companyId, perimeterId]
+            );
+            const scopedUserIds = new Set(scopedUsers.rows.map((row: { id: string }) => row.id));
+            const invalidUserIds = userIds.filter((id) => !scopedUserIds.has(id));
+            if (invalidUserIds.length > 0) {
+                return res.status(400).json({
+                    ok: false,
+                    error: "INVALID_USER_SCOPE",
+                    message: "Alcuni utenti non appartengono al perimetro corrente.",
+                    invalid_user_ids: invalidUserIds,
+                    correlationId,
+                });
+            }
+
+            const out = await pool.query(
+                `
+                insert into ${assignmentTable} (user_id, ${managerIdColumn}, company_id, perimeter_id)
+                select user_id, $2, $3, $4
+                from unnest($1::uuid[]) as user_id
+                on conflict (user_id, ${managerIdColumn}) do nothing
+                `,
+                [userIds, managerId, companyId, perimeterId]
+            );
+
+            return res.json({
+                ok: true,
+                assigned: out.rowCount ?? 0,
+                correlationId,
+            });
+        } catch (e) {
+            next(e);
+        }
+    });
+
+    adminRouter.delete(`${resourcePath}/:id/assign/:userId`, requireOperationalPerimeterAdmin, async (req, res, next) => {
+        try {
+            const correlationId = (req as any).correlationId;
+            const managerId = String(req.params.id ?? "").trim();
+            const userId = String(req.params.userId ?? "").trim();
+            const { companyId, perimeterId } = getTenantScope(req);
+            if (!companyId || !perimeterId) {
+                return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            }
+
+            const del = await pool.query(
+                `
+                delete from ${assignmentTable}
+                where ${managerIdColumn} = $1
+                  and user_id = $2
+                  and company_id = $3
+                  and perimeter_id = $4
+                `,
+                [managerId, userId, companyId, perimeterId]
+            );
+
+            return res.json({
+                ok: true,
+                removed: del.rowCount ?? 0,
+                correlationId,
+            });
+        } catch (e) {
+            next(e);
+        }
+    });
+}
+
+registerManagerEntityRoutes({
+    resourcePath: "/responsabili",
+    managerTable: "responsabili",
+    assignmentTable: "user_responsabile_assignments",
+    managerIdColumn: "responsabile_id",
+    listProperty: "responsabili",
+});
+
+registerManagerEntityRoutes({
+    resourcePath: "/hr-managers",
+    managerTable: "hr_managers",
+    assignmentTable: "user_hr_assignments",
+    managerIdColumn: "hr_manager_id",
+    listProperty: "hr_managers",
 });
 
 adminRouter.get("/test-scenarios", async (req, res, next) => {
@@ -2770,5 +3387,31 @@ adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, 
             detail: String(e?.message ?? e),
             correlationId,
         });
+    }
+});
+
+/**
+ * GET /api/admin/campaigns
+ * Returns all campaigns for the current perimeter, sorted by created_at desc.
+ */
+adminRouter.get("/campaigns", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId: (req as any).correlationId });
+        }
+        const { rows } = await pool.query(
+            `SELECT id, status, reservations_opened_at, reservations_closed_at,
+                    campaign_opened_at, campaign_closed_at,
+                    reserved_users_count, total_applications_count, created_at
+             FROM campaigns
+             WHERE company_id = $1 AND perimeter_id = $2
+             ORDER BY created_at DESC
+             LIMIT 100`,
+            [companyId, perimeterId]
+        );
+        return res.json({ ok: true, campaigns: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
     }
 });
