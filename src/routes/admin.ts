@@ -712,6 +712,36 @@ adminRouter.post(
                     [scenarioId, companyId, perimeterId]
                 );
 
+                await client.query(
+                    `
+                    insert into test_scenario_initialized_users
+                      (company_id, perimeter_id, campaign_id, scenario_id, user_id)
+                    select distinct $2, $3, $4, $1, x.user_id
+                    from (
+                      select tsa.user_id
+                      from test_scenario_applications tsa
+                      where tsa.scenario_id = $1
+                        and tsa.company_id = $2
+                        and tsa.perimeter_id = $3
+
+                      union
+
+                      select p.occupied_by as user_id
+                      from test_scenario_applications tsa
+                      join positions p on p.id = tsa.position_id
+                      where tsa.scenario_id = $1
+                        and tsa.company_id = $2
+                        and tsa.perimeter_id = $3
+                        and p.occupied_by is not null
+                    ) x
+                    on conflict (company_id, perimeter_id, campaign_id, user_id)
+                    do update set
+                      scenario_id = excluded.scenario_id,
+                      initialized_at = now()
+                    `,
+                    [scenarioId, companyId, perimeterId, activeCampaignId]
+                );
+
                 await client.query(`
                     update users u
                     set application_count = coalesce(x.cnt, 0)
@@ -1328,6 +1358,7 @@ adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req
                 snapshot,
                 usersReset: result.usersReset,
                 applicationsDeleted: result.applicationsDeleted,
+                testScenarioUsersReset: result.testScenarioUsersReset,
             };
         });
 
@@ -1349,6 +1380,7 @@ adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req
                 ...(out.snapshot ?? {}),
                 usersReset: out.usersReset,
                 applicationsDeleted: out.applicationsDeleted,
+                testScenarioUsersReset: out.testScenarioUsersReset,
             },
             correlationId,
             { companyId, perimeterId }

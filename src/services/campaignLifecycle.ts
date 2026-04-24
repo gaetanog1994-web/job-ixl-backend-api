@@ -253,7 +253,12 @@ export async function closeCampaign(
   client: PoolClient,
   companyId: string,
   perimeterId: string
-): Promise<{ campaign: CampaignRow; applicationsDeleted: number; usersReset: number } | { error: TransitionError }> {
+): Promise<{
+  campaign: CampaignRow;
+  applicationsDeleted: number;
+  usersReset: number;
+  testScenarioUsersReset: number;
+} | { error: TransitionError }> {
   const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
   const invalid = validateCloseCampaign(lifecycle);
   if (invalid) return { error: invalid };
@@ -286,6 +291,32 @@ export async function closeCampaign(
     [companyId, perimeterId, campaignId]
   );
 
+  const resetTestScenarioUsers = await client.query(
+    `UPDATE users u
+     SET availability_status = 'inactive',
+         is_reserved = false,
+         show_position = false
+     WHERE u.company_id = $1
+       AND coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+       AND EXISTS (
+         SELECT 1
+         FROM test_scenario_initialized_users tsiu
+         WHERE tsiu.company_id = $1
+           AND tsiu.perimeter_id = $2
+           AND tsiu.campaign_id = $3
+           AND tsiu.user_id = u.id
+       )`,
+    [companyId, perimeterId, campaignId]
+  );
+
+  await client.query(
+    `DELETE FROM test_scenario_initialized_users
+     WHERE company_id = $1
+       AND perimeter_id = $2
+       AND campaign_id = $3`,
+    [companyId, perimeterId, campaignId]
+  );
+
   const usersReset = await client.query(
     `UPDATE users
      SET availability_status = 'inactive', is_reserved = false, show_position = false, application_count = 0
@@ -303,5 +334,6 @@ export async function closeCampaign(
     campaign: rows[0],
     applicationsDeleted: deletedApplications.rowCount ?? 0,
     usersReset: usersReset.rowCount ?? 0,
+    testScenarioUsersReset: resetTestScenarioUsers.rowCount ?? 0,
   };
 }
