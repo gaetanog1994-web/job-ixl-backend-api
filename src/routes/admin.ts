@@ -669,18 +669,32 @@ adminRouter.post(
                     } as const;
                 }
                 const activeCampaignId = lifecycle.campaignId;
+                const applicationsColumns = await getTableColumns(client, "applications");
+                const applicationsHasCampaignId = applicationsColumns.has("campaign_id");
 
                 const insertedApplications = await client.query(
-                    `
-            insert into applications (user_id, position_id, priority, company_id, perimeter_id, campaign_id)
-            select user_id, position_id, priority, company_id, perimeter_id, $4
-            from test_scenario_applications
-            where scenario_id = $1
-              and company_id = $2
-              and perimeter_id = $3
-            on conflict (user_id, position_id) do nothing
-        `,
-                    [scenarioId, companyId, perimeterId, activeCampaignId]
+                    applicationsHasCampaignId
+                        ? `
+                        insert into applications (user_id, position_id, priority, company_id, perimeter_id, campaign_id)
+                        select user_id, position_id, priority, company_id, perimeter_id, $4
+                        from test_scenario_applications
+                        where scenario_id = $1
+                          and company_id = $2
+                          and perimeter_id = $3
+                        on conflict (user_id, position_id) do nothing
+                        `
+                        : `
+                        insert into applications (user_id, position_id, priority, company_id, perimeter_id)
+                        select user_id, position_id, priority, company_id, perimeter_id
+                        from test_scenario_applications
+                        where scenario_id = $1
+                          and company_id = $2
+                          and perimeter_id = $3
+                        on conflict (user_id, position_id) do nothing
+                        `,
+                    applicationsHasCampaignId
+                        ? [scenarioId, companyId, perimeterId, activeCampaignId]
+                        : [scenarioId, companyId, perimeterId]
                 );
 
                 const forcedAvailable = await client.query(
@@ -754,31 +768,41 @@ adminRouter.post(
                     );
                 }
 
-                await client.query(`
+                await client.query(
+                    `
                     update users u
                     set application_count = coalesce(x.cnt, 0)
                     from (
                         select u2.id as user_id, count(a.*)::int as cnt
                         from users u2
-                        left join applications a on a.user_id = u2.id and a.company_id = $1 and a.perimeter_id = $2 and a.campaign_id = $3
+                        left join applications a on a.user_id = u2.id and a.company_id = $1 and a.perimeter_id = $2
+                        ${applicationsHasCampaignId ? "and a.campaign_id = $3" : ""}
                         where u2.company_id = $1
                           and coalesce(u2.perimeter_id, u2.home_perimeter_id) = $2
                         group by u2.id
                     ) x
                     where u.id = x.user_id
                     `,
-                    [companyId, perimeterId, activeCampaignId]
+                    applicationsHasCampaignId
+                        ? [companyId, perimeterId, activeCampaignId]
+                        : [companyId, perimeterId]
                 );
 
-                await client.query(`
+                await client.query(
+                    `
                     update users
                     set application_count = 0
                     where company_id = $1
                       and coalesce(perimeter_id, home_perimeter_id) = $2
                       and id not in (
-                        select distinct user_id from applications where company_id = $1 and perimeter_id = $2 and campaign_id = $3
+                        select distinct user_id from applications where company_id = $1 and perimeter_id = $2
+                        ${applicationsHasCampaignId ? "and campaign_id = $3" : ""}
                       )
-                `, [companyId, perimeterId, activeCampaignId]);
+                    `,
+                    applicationsHasCampaignId
+                        ? [companyId, perimeterId, activeCampaignId]
+                        : [companyId, perimeterId]
+                );
 
                 // Business rule: initializing a test scenario while campaign is open
                 // must overwrite reservation counts with the current initialized state.
