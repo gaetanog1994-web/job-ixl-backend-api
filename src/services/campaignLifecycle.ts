@@ -249,6 +249,24 @@ export async function openCampaign(
   return { campaign: rows[0], usersUpdated: usersUpdate.rowCount ?? 0 };
 }
 
+async function hasColumn(
+  client: PoolClient,
+  tableName: string,
+  columnName: string
+): Promise<boolean> {
+  const { rows } = await client.query<{ ok: boolean }>(
+    `SELECT EXISTS (
+       SELECT 1
+       FROM information_schema.columns
+       WHERE table_schema = 'public'
+         AND table_name = $1
+         AND column_name = $2
+     ) AS ok`,
+    [tableName, columnName]
+  );
+  return rows[0]?.ok === true;
+}
+
 export async function closeCampaign(
   client: PoolClient,
   companyId: string,
@@ -264,58 +282,83 @@ export async function closeCampaign(
   if (invalid) return { error: invalid };
 
   const campaignId = lifecycle.campaignId!;
+  const applicationsHasCampaignId = await hasColumn(client, "applications", "campaign_id");
+  const tsiuHasCampaignId = await hasColumn(client, "test_scenario_initialized_users", "campaign_id");
 
   const appCountRes = await client.query<{ cnt: string }>(
-    `SELECT count(*)::text as cnt
-     FROM applications
-     WHERE company_id = $1
-       AND perimeter_id = $2
-       AND campaign_id = $3`,
-    [companyId, perimeterId, campaignId]
+    applicationsHasCampaignId
+      ? `SELECT count(*)::text as cnt
+         FROM applications
+         WHERE company_id = $1
+           AND perimeter_id = $2
+           AND campaign_id = $3`
+      : `SELECT count(*)::text as cnt
+         FROM applications
+         WHERE company_id = $1
+           AND perimeter_id = $2`,
+    applicationsHasCampaignId
+      ? [companyId, perimeterId, campaignId]
+      : [companyId, perimeterId]
   );
   const totalApplications = Number(appCountRes.rows[0]?.cnt ?? 0);
 
   await client.query(
-    `INSERT INTO campaign_applications_snapshot
-       (campaign_id, company_id, perimeter_id, user_id, position_id, target_user_id, priority, original_created_at)
-     SELECT $1, a.company_id, a.perimeter_id, a.user_id, a.position_id,
-            p.occupied_by, a.priority, a.created_at
-     FROM applications a
-     LEFT JOIN positions p ON p.id = a.position_id
-     WHERE a.company_id = $2 AND a.perimeter_id = $3 AND a.campaign_id = $1`,
+    applicationsHasCampaignId
+      ? `INSERT INTO campaign_applications_snapshot
+           (campaign_id, company_id, perimeter_id, user_id, position_id, target_user_id, priority, original_created_at)
+         SELECT $1, a.company_id, a.perimeter_id, a.user_id, a.position_id,
+                p.occupied_by, a.priority, a.created_at
+         FROM applications a
+         LEFT JOIN positions p ON p.id = a.position_id
+         WHERE a.company_id = $2 AND a.perimeter_id = $3 AND a.campaign_id = $1`
+      : `INSERT INTO campaign_applications_snapshot
+           (campaign_id, company_id, perimeter_id, user_id, position_id, target_user_id, priority, original_created_at)
+         SELECT $1, a.company_id, a.perimeter_id, a.user_id, a.position_id,
+                p.occupied_by, a.priority, a.created_at
+         FROM applications a
+         LEFT JOIN positions p ON p.id = a.position_id
+         WHERE a.company_id = $2 AND a.perimeter_id = $3`,
     [campaignId, companyId, perimeterId]
   );
 
   const deletedApplications = await client.query(
-    `DELETE FROM applications WHERE company_id = $1 AND perimeter_id = $2 AND campaign_id = $3`,
-    [companyId, perimeterId, campaignId]
+    applicationsHasCampaignId
+      ? `DELETE FROM applications WHERE company_id = $1 AND perimeter_id = $2 AND campaign_id = $3`
+      : `DELETE FROM applications WHERE company_id = $1 AND perimeter_id = $2`,
+    applicationsHasCampaignId
+      ? [companyId, perimeterId, campaignId]
+      : [companyId, perimeterId]
   );
 
-  const resetTestScenarioUsers = await client.query(
-    `UPDATE users u
-     SET availability_status = 'inactive',
-         is_reserved = false,
-         show_position = false
-     WHERE u.company_id = $1
-       AND coalesce(u.perimeter_id, u.home_perimeter_id) = $2
-       AND EXISTS (
-         SELECT 1
-         FROM test_scenario_initialized_users tsiu
-         WHERE tsiu.company_id = $1
-           AND tsiu.perimeter_id = $2
-           AND tsiu.campaign_id = $3
-           AND tsiu.user_id = u.id
-       )`,
-    [companyId, perimeterId, campaignId]
-  );
+  let resetTestScenarioUsersCount = 0;
+  if (tsiuHasCampaignId) {
+    const resetTestScenarioUsers = await client.query(
+      `UPDATE users u
+       SET availability_status = 'inactive',
+           is_reserved = false,
+           show_position = false
+       WHERE u.company_id = $1
+         AND coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+         AND EXISTS (
+           SELECT 1
+           FROM test_scenario_initialized_users tsiu
+           WHERE tsiu.company_id = $1
+             AND tsiu.perimeter_id = $2
+             AND tsiu.campaign_id = $3
+             AND tsiu.user_id = u.id
+         )`,
+      [companyId, perimeterId, campaignId]
+    );
+    resetTestScenarioUsersCount = resetTestScenarioUsers.rowCount ?? 0;
 
-  await client.query(
-    `DELETE FROM test_scenario_initialized_users
-     WHERE company_id = $1
-       AND perimeter_id = $2
-       AND campaign_id = $3`,
-    [companyId, perimeterId, campaignId]
-  );
+    await client.query(
+      `DELETE FROM test_scenario_initialized_users
+       WHERE company_id = $1
+         AND perimeter_id = $2
+         AND campaign_id = $3`,
+      [companyId, perimeterId, campaignId]
+    );
+  }
 
   const usersReset = await client.query(
     `UPDATE users
@@ -334,6 +377,6 @@ export async function closeCampaign(
     campaign: rows[0],
     applicationsDeleted: deletedApplications.rowCount ?? 0,
     usersReset: usersReset.rowCount ?? 0,
-    testScenarioUsersReset: resetTestScenarioUsers.rowCount ?? 0,
+    testScenarioUsersReset: resetTestScenarioUsersCount,
   };
 }
