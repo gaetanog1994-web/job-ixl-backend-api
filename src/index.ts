@@ -117,6 +117,16 @@ app.use(
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 app.use(correlation);
+app.use((req, res, next) => {
+    const originalJson = res.json.bind(res);
+    res.json = ((body?: any) => {
+        if (body && typeof body === "object" && !Array.isArray(body) && body.correlationId == null) {
+            return originalJson({ ...body, correlationId: getCorrelationId(req) });
+        }
+        return originalJson(body);
+    }) as typeof res.json;
+    next();
+});
 
 app.get("/api/me", requireAuth, attachAccessContext, (req, res) => {
     const r = req as AuthedRequest;
@@ -306,7 +316,7 @@ const adminApi = express.Router();
 // Order: attachAccessContext before requireAdmin to avoid double DB call.
 // requireAdmin reads r.accessContext set by attachAccessContext.
 // requirePerimeterAdmin removed: requireAdmin already enforces canManagePerimeter.
-adminApi.use(requireAuth, adminLimiter, attachAccessContext, requireAdmin);
+adminApi.use(requireAuth, attachAccessContext, requireAdmin, adminLimiter);
 
 // 1) rotte admin “normali”
 adminApi.use("/", adminRouter);

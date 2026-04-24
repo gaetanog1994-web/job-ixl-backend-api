@@ -477,6 +477,17 @@
  *       201: { description: Role created }
  *
  * /api/admin/roles/{id}:
+ *   put:
+ *     tags: [Admin]
+ *     summary: Rename role
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200: { description: Role updated }
  *   delete:
  *     tags: [Admin]
  *     summary: Delete role
@@ -488,6 +499,36 @@
  *         schema: { type: string, format: uuid }
  *     responses:
  *       200: { description: Role deleted }
+ *
+ * /api/admin/roles/{id}/compatibility:
+ *   post:
+ *     tags: [Admin]
+ *     summary: Add role compatibility (bidirectional)
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       201: { description: Compatibility added }
+ *
+ * /api/admin/roles/{id}/compatibility/{targetId}:
+ *   delete:
+ *     tags: [Admin]
+ *     summary: Remove role compatibility (bidirectional)
+ *     security: [{ bearerAuth: [] }]
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *       - in: path
+ *         name: targetId
+ *         required: true
+ *         schema: { type: string, format: uuid }
+ *     responses:
+ *       200: { description: Compatibility removed }
  *
  * /api/admin/interlocking-scenarios:
  *   get:

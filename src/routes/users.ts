@@ -169,6 +169,10 @@ usersRouter.get("/me/applications", async (req, res, next) => {
             e.status = 400;
             throw e;
         }
+        const lifecycle = await getCampaignStatus(access.currentCompanyId, access.currentPerimeterId);
+        if (!lifecycle.campaign_id) {
+            return res.json({ ok: true, applications: [], correlationId: (req as any).correlationId ?? null });
+        }
 
         const { rows } = await pool.query(
             `
@@ -227,9 +231,10 @@ usersRouter.get("/me/applications", async (req, res, next) => {
       where a.user_id = $1
         and a.company_id = $2
         and a.perimeter_id = $3
+        and a.campaign_id = $4
       order by a.priority asc, a.created_at asc
       `,
-            [userId, access.currentCompanyId, access.currentPerimeterId]
+            [userId, access.currentCompanyId, access.currentPerimeterId, lifecycle.campaign_id]
         );
 
         // ricostruiamo una shape compatibile con la vecchia select supabase (minimo necessario)
@@ -293,7 +298,11 @@ usersRouter.post("/me/reservation", async (req, res) => {
     const perimeterId = r.accessContext?.currentPerimeterId ?? null;
 
     if (!companyId || !perimeterId) {
-        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        return res.status(400).json({
+            ok: false,
+            error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+            correlationId,
+        });
     }
 
     try {
@@ -355,11 +364,29 @@ usersRouter.post("/me/reservation", async (req, res) => {
         }
 
         invalidateMapCache();
-        await audit("user_reserve_for_campaign", r.user.id, {}, out, correlationId);
+        await audit(
+            "user_reserve_for_campaign",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            out,
+            correlationId,
+            { companyId, perimeterId }
+        );
         return res.status(200).json({ ok: true, ...out, correlationId });
     } catch (e: any) {
-        await audit("user_reserve_for_campaign", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
-        return res.status(500).json({ error: "RESERVE_FAILED", correlationId });
+        await audit(
+            "user_reserve_for_campaign",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            { error: String(e?.message ?? e) },
+            correlationId,
+            { companyId, perimeterId }
+        );
+        return res.status(500).json({
+            ok: false,
+            error: { code: "RESERVE_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
@@ -374,7 +401,11 @@ usersRouter.delete("/me/reservation", async (req, res) => {
     const perimeterId = r.accessContext?.currentPerimeterId ?? null;
 
     if (!companyId || !perimeterId) {
-        return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        return res.status(400).json({
+            ok: false,
+            error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+            correlationId,
+        });
     }
 
     try {
@@ -436,11 +467,29 @@ usersRouter.delete("/me/reservation", async (req, res) => {
         }
 
         invalidateMapCache();
-        await audit("user_unreserve_for_campaign", r.user.id, {}, out, correlationId);
+        await audit(
+            "user_unreserve_for_campaign",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            out,
+            correlationId,
+            { companyId, perimeterId }
+        );
         return res.status(200).json({ ok: true, ...out, correlationId });
     } catch (e: any) {
-        await audit("user_unreserve_for_campaign", r.user.id, {}, { error: String(e?.message ?? e) }, correlationId);
-        return res.status(500).json({ error: "UNRESERVE_FAILED", correlationId });
+        await audit(
+            "user_unreserve_for_campaign",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            { error: String(e?.message ?? e) },
+            correlationId,
+            { companyId, perimeterId }
+        );
+        return res.status(500).json({
+            ok: false,
+            error: { code: "UNRESERVE_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 

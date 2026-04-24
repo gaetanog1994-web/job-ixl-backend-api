@@ -56,6 +56,17 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
         let body: string | undefined;
         if (method !== "GET" && method !== "HEAD") {
             const sourceBody = req.body && typeof req.body === "object" ? req.body : {};
+            if (
+                forwardPath === "/graph/chains" &&
+                typeof (sourceBody as any).campaign_id !== "string" &&
+                typeof (sourceBody as any).campaignId !== "string"
+            ) {
+                return res.status(400).json({
+                    ok: false,
+                    error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required for graph/chains" },
+                    correlationId,
+                });
+            }
             body = JSON.stringify({
                 ...sourceBody,
                 companyId: access.currentCompanyId,
@@ -107,7 +118,11 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
                     status: resp.status,
                     graphStatus: parsedBody?.status ?? null,
                 },
-                correlationId
+                correlationId,
+                {
+                    companyId: access.currentCompanyId,
+                    perimeterId: access.currentPerimeterId,
+                }
             );
         }
 

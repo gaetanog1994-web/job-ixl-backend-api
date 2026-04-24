@@ -47,6 +47,15 @@ graphProxyRouter.use(async (req, res) => {
         let body;
         if (method !== "GET" && method !== "HEAD") {
             const sourceBody = req.body && typeof req.body === "object" ? req.body : {};
+            if (forwardPath === "/graph/chains" &&
+                typeof sourceBody.campaign_id !== "string" &&
+                typeof sourceBody.campaignId !== "string") {
+                return res.status(400).json({
+                    ok: false,
+                    error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required for graph/chains" },
+                    correlationId,
+                });
+            }
             body = JSON.stringify({
                 ...sourceBody,
                 companyId: access.currentCompanyId,

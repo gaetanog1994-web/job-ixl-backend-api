@@ -35,55 +35,75 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
     try {
         const access = (req as AuthedRequest).accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
-            return res.status(400).json({ error: "Perimeter context required", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
-        // 1) Leggi applications (source of truth)
+        const campaignId = String((req.body as any)?.campaign_id ?? "").trim();
+        if (!campaignId) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required" },
+                correlationId,
+            });
+        }
+
+        const { data: campaign, error: campaignErr } = await supabaseAdmin
+            .from("campaigns")
+            .select("id")
+            .eq("id", campaignId)
+            .eq("company_id", access.currentCompanyId)
+            .eq("perimeter_id", access.currentPerimeterId)
+            .eq("status", "campaign_closed")
+            .maybeSingle();
+        if (campaignErr) {
+            await reportError({
+                event: "graph_sync_validate_campaign_failed",
+                message: campaignErr.message,
+                correlationId,
+                status: 400,
+                code: "GRAPH_SYNC_VALIDATE_CAMPAIGN_FAILED",
+                operation: "sync_graph_validate_campaign",
+            });
+            return res.status(400).json({ error: campaignErr.message, correlationId });
+        }
+        if (!campaign?.id) {
+            return res.status(404).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
+                correlationId,
+            });
+        }
+
+        // 1) Leggi snapshot candidatura per la campagna selezionata
         const { data: apps, error: appsErr } = await supabaseAdmin
-            .from("applications")
-            .select("user_id, position_id, priority")
+            .from("campaign_applications_snapshot")
+            .select("user_id, target_user_id, priority")
+            .eq("campaign_id", campaignId)
             .eq("company_id", access.currentCompanyId)
             .eq("perimeter_id", access.currentPerimeterId);
         if (appsErr) {
             await reportError({
-                event: "graph_sync_read_applications_failed",
+                event: "graph_sync_read_snapshot_failed",
                 message: appsErr.message,
                 correlationId,
                 status: 500,
-                code: "GRAPH_SYNC_READ_APPS_FAILED",
-                operation: "sync_graph_read_applications",
+                code: "GRAPH_SYNC_READ_SNAPSHOT_FAILED",
+                operation: "sync_graph_read_snapshot",
             });
             return res.status(500).json({ error: appsErr.message, correlationId });
         }
-
-        const positionIds = Array.from(
-            new Set((apps ?? []).map((a: any) => a.position_id).filter(Boolean))
-        );
-
-        // 2) Leggi positions per ricavare target_user_id (occupied_by)
-        const { data: positions, error: posErr } = await supabaseAdmin
-            .from("positions")
-            .select("id, occupied_by")
-            .in("id", positionIds)
-            .eq("company_id", access.currentCompanyId)
-            .eq("perimeter_id", access.currentPerimeterId);
-        if (posErr) {
-            await reportError({
-                event: "graph_sync_read_positions_failed",
-                message: posErr.message,
-                correlationId,
-                status: 500,
-                code: "GRAPH_SYNC_READ_POSITIONS_FAILED",
-                operation: "sync_graph_read_positions",
-            });
-            return res.status(500).json({ error: posErr.message, correlationId });
-        }
-
-        const posToOccupant = new Map((positions ?? []).map((p) => [p.id, p.occupied_by]));
         const edges = (apps ?? [])
             .map((a) => ({
                 user_id: a.user_id,
-                target_user_id: posToOccupant.get(a.position_id) ?? null,
+                target_user_id: a.target_user_id ?? null,
                 priority: a.priority ?? null,
+                campaign_id: campaignId,
                 company_id: access.currentCompanyId,
                 perimeter_id: access.currentPerimeterId,
             }))
@@ -152,6 +172,8 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
             body: JSON.stringify({
                 applications: edges,
                 usersById,
+                campaignId,
+                campaign_id: campaignId,
                 companyId: access.currentCompanyId,
                 perimeterId: access.currentPerimeterId,
                 company_id: access.currentCompanyId,
@@ -197,6 +219,11 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
                     upstreamStatus: buildRes.status,
                 },
                 correlationId
+                ,
+                {
+                    companyId: access.currentCompanyId,
+                    perimeterId: access.currentPerimeterId,
+                }
             );
 
             return res.status(mappedStatus).json({
@@ -220,18 +247,24 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
             },
             {
                 ok: true,
+                campaignId,
                 applicationsRead: apps?.length ?? 0,
                 edgesBuilt: edges.length,
                 usersMapped: Object.keys(usersById).length,
                 upstreamStatus: buildRes.status,
             },
-            correlationId
+            correlationId,
+            {
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            }
         );
 
         return res.status(200).json({
             ok: true,
             correlationId,
             dataset: {
+                campaignId,
                 applicationsRead: apps?.length ?? 0,
                 applicationsScoped: apps?.length ?? 0,
                 edgesBuilt: edges.length,
@@ -256,6 +289,10 @@ syncGraphRouter.post("/", async (req: Request, res: Response) => {
             { ok: false, error: e?.message ?? String(e) },
             correlationId
         );
-        return res.status(500).json({ error: e?.message ?? String(e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "GRAPH_SYNC_UNHANDLED", message: e?.message ?? String(e) },
+            correlationId,
+        });
     }
 });

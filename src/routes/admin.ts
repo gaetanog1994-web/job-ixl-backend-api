@@ -659,18 +659,28 @@ adminRouter.post(
                         },
                     } as const;
                 }
+                if (!lifecycle.campaignId) {
+                    return {
+                        invalid: {
+                            status: 409,
+                            code: "CAMPAIGN_ID_MISSING",
+                            message: "Campagna attiva non trovata per il perimetro corrente.",
+                        },
+                    } as const;
+                }
+                const activeCampaignId = lifecycle.campaignId;
 
                 const insertedApplications = await client.query(
                     `
-            insert into applications (user_id, position_id, priority, company_id, perimeter_id)
-            select user_id, position_id, priority, company_id, perimeter_id
+            insert into applications (user_id, position_id, priority, company_id, perimeter_id, campaign_id)
+            select user_id, position_id, priority, company_id, perimeter_id, $4
             from test_scenario_applications
             where scenario_id = $1
               and company_id = $2
               and perimeter_id = $3
             on conflict (user_id, position_id) do nothing
         `,
-                    [scenarioId, companyId, perimeterId]
+                    [scenarioId, companyId, perimeterId, activeCampaignId]
                 );
 
                 const forcedAvailable = await client.query(
@@ -708,14 +718,14 @@ adminRouter.post(
                     from (
                         select u2.id as user_id, count(a.*)::int as cnt
                         from users u2
-                        left join applications a on a.user_id = u2.id and a.company_id = $1 and a.perimeter_id = $2
+                        left join applications a on a.user_id = u2.id and a.company_id = $1 and a.perimeter_id = $2 and a.campaign_id = $3
                         where u2.company_id = $1
                           and coalesce(u2.perimeter_id, u2.home_perimeter_id) = $2
                         group by u2.id
                     ) x
                     where u.id = x.user_id
                     `,
-                    [companyId, perimeterId]
+                    [companyId, perimeterId, activeCampaignId]
                 );
 
                 await client.query(`
@@ -724,9 +734,9 @@ adminRouter.post(
                     where company_id = $1
                       and coalesce(perimeter_id, home_perimeter_id) = $2
                       and id not in (
-                        select distinct user_id from applications where company_id = $1 and perimeter_id = $2
+                        select distinct user_id from applications where company_id = $1 and perimeter_id = $2 and campaign_id = $3
                       )
-                `, [companyId, perimeterId]);
+                `, [companyId, perimeterId, activeCampaignId]);
 
                 return {
                     insertedApplications: insertedApplications.rowCount ?? 0,
@@ -1108,14 +1118,22 @@ adminRouter.get("/campaign-status", requireOperationalPerimeterAdmin, async (req
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
-            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
         const out = await withTx(async (client) => {
             return readLifecycleSnapshot(client, companyId, perimeterId);
         });
         return res.json({ ok: true, ...out, correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "CAMPAIGN_STATUS_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
@@ -1142,7 +1160,11 @@ adminRouter.post("/reservations/open", requireOperationalPerimeterAdmin, async (
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
-            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
 
         const out = await withTx(async (client) => {
@@ -1154,14 +1176,29 @@ adminRouter.post("/reservations/open", requireOperationalPerimeterAdmin, async (
 
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
-            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+            return res.status(invalid.status).json({
+                ok: false,
+                error: { code: invalid.code, message: invalid.message },
+                correlationId,
+            });
         }
 
         invalidateMapCache();
-        await audit("admin_open_reservations", r.user.id, { perimeterId }, out.snapshot, correlationId);
+        await audit(
+            "admin_open_reservations",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            out.snapshot,
+            correlationId,
+            { companyId, perimeterId }
+        );
         return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "OPEN_RESERVATIONS_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
@@ -1174,7 +1211,11 @@ adminRouter.post("/reservations/close", requireOperationalPerimeterAdmin, async 
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
-            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
 
         const out = await withTx(async (client) => {
@@ -1186,14 +1227,29 @@ adminRouter.post("/reservations/close", requireOperationalPerimeterAdmin, async 
 
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
-            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+            return res.status(invalid.status).json({
+                ok: false,
+                error: { code: invalid.code, message: invalid.message },
+                correlationId,
+            });
         }
 
         invalidateMapCache();
-        await audit("admin_close_reservations", r.user.id, { perimeterId }, out.snapshot, correlationId);
+        await audit(
+            "admin_close_reservations",
+            r.user.id,
+            { company_id: companyId, perimeter_id: perimeterId },
+            out.snapshot,
+            correlationId,
+            { companyId, perimeterId }
+        );
         return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "CLOSE_RESERVATIONS_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
@@ -1206,7 +1262,11 @@ adminRouter.post("/campaign/open", requireOperationalPerimeterAdmin, async (req:
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
-            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
 
         const out = await withTx(async (client) => {
@@ -1218,20 +1278,29 @@ adminRouter.post("/campaign/open", requireOperationalPerimeterAdmin, async (req:
 
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
-            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+            return res.status(invalid.status).json({
+                ok: false,
+                error: { code: invalid.code, message: invalid.message },
+                correlationId,
+            });
         }
 
         invalidateMapCache();
         await audit(
             "admin_open_campaign",
             r.user.id,
-            { perimeterId },
+            { company_id: companyId, perimeter_id: perimeterId },
             { ...(out.snapshot ?? {}), usersUpdated: out.usersUpdated },
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
         return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "OPEN_CAMPAIGN_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
@@ -1244,7 +1313,11 @@ adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req
     try {
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
-            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
 
         const out = await withTx(async (client) => {
@@ -1260,30 +1333,51 @@ adminRouter.post("/campaign/close", requireOperationalPerimeterAdmin, async (req
 
         if ("invalid" in out && out.invalid) {
             const invalid = out.invalid;
-            return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
+            return res.status(invalid.status).json({
+                ok: false,
+                error: { code: invalid.code, message: invalid.message },
+                correlationId,
+            });
         }
 
         invalidateMapCache();
         await audit(
             "admin_close_campaign",
             r.user.id,
-            { perimeterId },
+            { company_id: companyId, perimeter_id: perimeterId },
             {
                 ...(out.snapshot ?? {}),
                 usersReset: out.usersReset,
                 applicationsDeleted: out.applicationsDeleted,
             },
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
         return res.json({ ok: true, ...(out.snapshot ?? {}), correlationId });
     } catch (e: any) {
-        return res.status(500).json({ ok: false, error: String(e?.message ?? e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "CLOSE_CAMPAIGN_FAILED", message: String(e?.message ?? e) },
+            correlationId,
+        });
     }
 });
 
 adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId: (req as any).correlationId ?? null });
+        }
+        const lifecycle = await withTx((client) => loadCampaignLifecycle(client, companyId, perimeterId));
+        if (lifecycle.campaignStatus !== "open") {
+            return res.json({
+                ok: true,
+                applications: [],
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+
         const { rows } = await pool.query(
             `
       select
@@ -2279,13 +2373,438 @@ adminRouter.get("/locations", async (req, res, next) => {
 
 adminRouter.get("/roles", async (req, res, next) => {
     try {
-        const { rows } = await pool.query(`
-      select id, name
-      from roles
-      order by name asc
-      limit 2000
-    `);
-        return res.json({ ok: true, roles: rows, correlationId: (req as any).correlationId ?? null });
+        const correlationId = (req as any).correlationId ?? null;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const rolesRes = await pool.query(
+            `
+            with scoped_roles as (
+              select r.id, r.name
+              from roles r
+              where (
+                    r.company_id = $1
+                and r.perimeter_id = $2
+              )
+                 or (
+                    (r.company_id is null or r.perimeter_id is null)
+                and exists (
+                      select 1
+                      from users u_scope
+                      where u_scope.role_id = r.id
+                        and u_scope.company_id = $1
+                        and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                    )
+                 )
+            )
+            select
+              sr.id,
+              sr.name,
+              count(distinct u.id)::int as assigned_users_count
+            from scoped_roles sr
+            left join users u
+              on u.role_id = sr.id
+             and u.company_id = $1
+             and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+            group by sr.id, sr.name
+            order by sr.name asc
+            `,
+            [companyId, perimeterId]
+        );
+
+        const compatRes = await pool.query(
+            `
+            with scoped_roles as (
+              select r.id
+              from roles r
+              where (
+                    r.company_id = $1
+                and r.perimeter_id = $2
+              )
+                 or (
+                    (r.company_id is null or r.perimeter_id is null)
+                and exists (
+                      select 1
+                      from users u_scope
+                      where u_scope.role_id = r.id
+                        and u_scope.company_id = $1
+                        and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                    )
+                 )
+            )
+            select
+              rc.role_id,
+              rc.compatible_role_id,
+              cr.name as compatible_role_name
+            from role_compatibilities rc
+            join roles cr on cr.id = rc.compatible_role_id
+            join scoped_roles left_role on left_role.id = rc.role_id
+            join scoped_roles right_role on right_role.id = rc.compatible_role_id
+            order by cr.name asc
+            `,
+            [companyId, perimeterId]
+        );
+
+        const compatByRoleId = new Map<string, Array<{ compatible_role_id: string; compatible_role_name: string }>>();
+        for (const row of compatRes.rows) {
+            const roleId = String(row.role_id);
+            if (!compatByRoleId.has(roleId)) compatByRoleId.set(roleId, []);
+            compatByRoleId.get(roleId)!.push({
+                compatible_role_id: String(row.compatible_role_id),
+                compatible_role_name: String(row.compatible_role_name ?? ""),
+            });
+        }
+
+        const roles = rolesRes.rows.map((row: any) => ({
+            id: String(row.id),
+            name: String(row.name),
+            assigned_users_count: Number(row.assigned_users_count ?? 0),
+            compatibilities: compatByRoleId.get(String(row.id)) ?? [],
+        }));
+
+        return res.json({ ok: true, roles, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.post("/roles", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) return res.status(400).json({ ok: false, error: "missing name", correlationId });
+
+        const { rows } = await pool.query(
+            `
+            insert into roles (name, company_id, perimeter_id)
+            values ($1, $2, $3)
+            returning id, name, company_id, perimeter_id
+            `,
+            [name, companyId, perimeterId]
+        );
+
+        invalidateMapCache();
+        await audit("role_create", r.user.id, { name, companyId, perimeterId }, { role: rows[0] ?? null }, correlationId);
+        return res.status(201).json({ ok: true, role: rows[0] ?? null, correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({
+                ok: false,
+                error: "ROLE_ALREADY_EXISTS",
+                message: "Esiste già un ruolo con questo nome nel perimetro corrente.",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+        next(e);
+    }
+});
+
+adminRouter.put("/roles/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const roleId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) return res.status(400).json({ ok: false, error: "missing name", correlationId });
+
+        const { rows } = await pool.query(
+            `
+            update roles r
+            set name = $2,
+                company_id = coalesce(r.company_id, $3),
+                perimeter_id = coalesce(r.perimeter_id, $4)
+            where r.id = $1
+              and (
+                    (r.company_id = $3 and r.perimeter_id = $4)
+                 or (
+                      (r.company_id is null or r.perimeter_id is null)
+                  and not exists (
+                        select 1
+                        from users ux
+                        where ux.role_id = r.id
+                          and (
+                                ux.company_id <> $3
+                             or coalesce(ux.perimeter_id, ux.home_perimeter_id) <> $4
+                          )
+                    )
+                 )
+              )
+            returning id, name, company_id, perimeter_id
+            `,
+            [roleId, name, companyId, perimeterId]
+        );
+        if (!rows[0]) {
+            return res.status(404).json({
+                ok: false,
+                error: "ROLE_NOT_FOUND",
+                message: "Ruolo non trovato nel perimetro corrente.",
+                correlationId,
+            });
+        }
+
+        invalidateMapCache();
+        await audit("role_update", r.user.id, { roleId, name, companyId, perimeterId }, { role: rows[0] }, correlationId);
+        return res.json({ ok: true, role: rows[0], correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({
+                ok: false,
+                error: "ROLE_ALREADY_EXISTS",
+                message: "Esiste già un ruolo con questo nome nel perimetro corrente.",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+        next(e);
+    }
+});
+
+adminRouter.delete("/roles/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const roleId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+
+        const roleRes = await pool.query(
+            `
+            select
+              r.id,
+              r.name,
+              count(u.id)::int as users_count
+            from roles r
+            left join users u on u.role_id = r.id
+            where r.id = $1
+              and (
+                    (r.company_id = $2 and r.perimeter_id = $3)
+                 or (
+                      (r.company_id is null or r.perimeter_id is null)
+                  and not exists (
+                        select 1
+                        from users ux
+                        where ux.role_id = r.id
+                          and (
+                                ux.company_id <> $2
+                             or coalesce(ux.perimeter_id, ux.home_perimeter_id) <> $3
+                          )
+                    )
+                 )
+              )
+            group by r.id, r.name
+            `,
+            [roleId, companyId, perimeterId]
+        );
+
+        const roleRow = roleRes.rows[0] ?? null;
+        if (!roleRow) {
+            return res.status(404).json({
+                ok: false,
+                error: "ROLE_NOT_FOUND",
+                message: "Ruolo non trovato nel perimetro corrente.",
+                correlationId,
+            });
+        }
+
+        const usersCount = Number(roleRow.users_count ?? 0);
+        if (usersCount > 0) {
+            return res.status(409).json({
+                ok: false,
+                error: "ROLE_HAS_USERS",
+                message: "Impossibile eliminare il ruolo: ci sono utenti assegnati.",
+                users_count: usersCount,
+                correlationId,
+            });
+        }
+
+        const out = await withTx(async (client) => {
+            await client.query(
+                `delete from role_compatibilities where role_id = $1 or compatible_role_id = $1`,
+                [roleId]
+            );
+            const del = await client.query(
+                `
+                delete from roles r
+                where r.id = $1
+                  and (
+                        (r.company_id = $2 and r.perimeter_id = $3)
+                     or (
+                          (r.company_id is null or r.perimeter_id is null)
+                      and not exists (
+                            select 1
+                            from users ux
+                            where ux.role_id = r.id
+                              and (
+                                    ux.company_id <> $2
+                                 or coalesce(ux.perimeter_id, ux.home_perimeter_id) <> $3
+                              )
+                        )
+                     )
+                  )
+                `,
+                [roleId, companyId, perimeterId]
+            );
+            return { deleted: del.rowCount ?? 0 };
+        });
+
+        if ((out.deleted ?? 0) === 0) {
+            return res.status(404).json({
+                ok: false,
+                error: "ROLE_NOT_FOUND",
+                message: "Ruolo non trovato nel perimetro corrente.",
+                correlationId,
+            });
+        }
+
+        invalidateMapCache();
+        await audit("role_delete", r.user.id, { roleId, companyId, perimeterId }, out, correlationId);
+        return res.json({ ok: true, ...out, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.post("/roles/:id/compatibility", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const roleId = String(req.params.id ?? "").trim();
+        const targetId = String(req.body?.targetRoleId ?? req.body?.target_id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        if (!targetId) return res.status(400).json({ ok: false, error: "missing targetRoleId", correlationId });
+        if (roleId === targetId) {
+            return res.status(400).json({ ok: false, error: "ROLE_COMPATIBILITY_SELF_NOT_ALLOWED", correlationId });
+        }
+
+        const scopedRoles = await pool.query(
+            `
+            with selected as (
+              select r.id
+              from roles r
+              where r.id = any($1::uuid[])
+                and (
+                      (r.company_id = $2 and r.perimeter_id = $3)
+                   or (
+                        (r.company_id is null or r.perimeter_id is null)
+                    and not exists (
+                          select 1
+                          from users ux
+                          where ux.role_id = r.id
+                            and (
+                                  ux.company_id <> $2
+                               or coalesce(ux.perimeter_id, ux.home_perimeter_id) <> $3
+                            )
+                      )
+                   )
+                )
+            )
+            select id from selected
+            `,
+            [[roleId, targetId], companyId, perimeterId]
+        );
+        const foundIds = new Set(scopedRoles.rows.map((row: { id: string }) => row.id));
+        if (!foundIds.has(roleId) || !foundIds.has(targetId)) {
+            return res.status(404).json({
+                ok: false,
+                error: "ROLE_NOT_FOUND",
+                message: "Entrambi i ruoli devono appartenere al perimetro corrente.",
+                correlationId,
+            });
+        }
+
+        const out = await withTx(async (client) => {
+            const insertDirect = await client.query(
+                `
+                insert into role_compatibilities (role_id, compatible_role_id)
+                select $1, $2
+                where not exists (
+                  select 1
+                  from role_compatibilities
+                  where role_id = $1 and compatible_role_id = $2
+                )
+                `,
+                [roleId, targetId]
+            );
+            const insertReverse = await client.query(
+                `
+                insert into role_compatibilities (role_id, compatible_role_id)
+                select $1, $2
+                where not exists (
+                  select 1
+                  from role_compatibilities
+                  where role_id = $1 and compatible_role_id = $2
+                )
+                `,
+                [targetId, roleId]
+            );
+            return {
+                created: (insertDirect.rowCount ?? 0) + (insertReverse.rowCount ?? 0),
+            };
+        });
+
+        await audit(
+            "role_compatibility_add",
+            r.user.id,
+            { roleId, targetId, companyId, perimeterId },
+            out,
+            correlationId
+        );
+        return res.status(201).json({ ok: true, ...out, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+adminRouter.delete("/roles/:id/compatibility/:targetId", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const roleId = String(req.params.id ?? "").trim();
+        const targetId = String(req.params.targetId ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        if (!targetId) return res.status(400).json({ ok: false, error: "missing targetId", correlationId });
+
+        const out = await withTx(async (client) => {
+            const delDirect = await client.query(
+                `delete from role_compatibilities where role_id = $1 and compatible_role_id = $2`,
+                [roleId, targetId]
+            );
+            const delReverse = await client.query(
+                `delete from role_compatibilities where role_id = $1 and compatible_role_id = $2`,
+                [targetId, roleId]
+            );
+            return {
+                removed: (delDirect.rowCount ?? 0) + (delReverse.rowCount ?? 0),
+            };
+        });
+
+        await audit(
+            "role_compatibility_remove",
+            r.user.id,
+            { roleId, targetId, companyId, perimeterId },
+            out,
+            correlationId
+        );
+        return res.json({ ok: true, ...out, correlationId });
     } catch (e) {
         next(e);
     }
@@ -2982,34 +3501,6 @@ adminRouter.delete("/locations/:id", async (req, res, next) => {
     }
 });
 
-adminRouter.post("/roles", async (req, res, next) => {
-    try {
-        const { name } = req.body ?? {};
-        if (!name) return res.status(400).json({ ok: false, error: "missing name" });
-
-        const { rows } = await pool.query(
-            `insert into roles (name) values ($1) returning id, name`,
-            [String(name)]
-        );
-
-        invalidateMapCache();
-        return res.status(201).json({ ok: true, role: rows[0], correlationId: (req as any).correlationId ?? null });
-    } catch (e) {
-        next(e);
-    }
-});
-
-adminRouter.delete("/roles/:id", async (req, res, next) => {
-    try {
-        const id = req.params.id;
-        const del = await pool.query(`delete from roles where id = $1`, [id]);
-        invalidateMapCache();
-        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId: (req as any).correlationId ?? null });
-    } catch (e) {
-        next(e);
-    }
-});
-
 /**
  * POST /api/admin/test-scenarios
  */
@@ -3088,11 +3579,43 @@ adminRouter.get("/interlocking-scenarios", requireOperationalPerimeterAdmin, asy
     try {
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
+        const campaignId = String((req.query as any)?.campaign_id ?? "").trim();
+        if (!campaignId) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required" },
+                correlationId,
+            });
+        }
+
+        const campaignRes = await pool.query(
+            `
+            select id
+            from campaigns
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+              and status = 'campaign_closed'
+            limit 1
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+        if (!campaignRes.rows[0]) {
+            return res.status(404).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
+                correlationId,
+            });
+        }
 
         const { rows } = await pool.query(
             `
             select
               id,
+              campaign_id,
               scenario_code,
               generated_at,
               strategy,
@@ -3111,11 +3634,12 @@ adminRouter.get("/interlocking-scenarios", requireOperationalPerimeterAdmin, asy
             from interlocking_scenarios
             where company_id = $1
               and perimeter_id = $2
+              and campaign_id = $3
             order by generated_at desc, created_at desc
             limit 500
             `
             ,
-            [companyId, perimeterId]
+            [companyId, perimeterId, campaignId]
         );
 
         return res.json({
@@ -3132,10 +3656,42 @@ adminRouter.get("/interlocking-scenarios/export.csv", requireOperationalPerimete
     try {
         const correlationId = (req as any).correlationId;
         const { companyId, perimeterId } = getTenantScope(req);
+        const campaignId = String((req.query as any)?.campaign_id ?? "").trim();
+        if (!campaignId) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required" },
+                correlationId,
+            });
+        }
+
+        const campaignRes = await pool.query(
+            `
+            select id
+            from campaigns
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+              and status = 'campaign_closed'
+            limit 1
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+        if (!campaignRes.rows[0]) {
+            return res.status(404).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
+                correlationId,
+            });
+        }
 
         const { rows } = await pool.query(
             `
             select
+              campaign_id,
               scenario_code,
               generated_at,
               strategy,
@@ -3152,13 +3708,15 @@ adminRouter.get("/interlocking-scenarios/export.csv", requireOperationalPerimete
             from interlocking_scenarios
             where company_id = $1
               and perimeter_id = $2
+              and campaign_id = $3
             order by generated_at desc, created_at desc
             limit 5000
             `,
-            [companyId, perimeterId]
+            [companyId, perimeterId, campaignId]
         );
 
         const headers = [
+            "campaign_id",
             "scenario_code",
             "generated_at",
             "strategy",
@@ -3202,10 +3760,11 @@ adminRouter.get("/interlocking-scenarios/export.csv", requireOperationalPerimete
 adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
+    const { companyId, perimeterId } = getTenantScope(req);
 
     try {
-        const { companyId, perimeterId } = getTenantScope(req);
         const {
+            campaign_id,
             scenario_code,
             generated_at,
             strategy,
@@ -3222,10 +3781,34 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
             optimal_chains_json,
         } = req.body ?? {};
 
-        if (!scenario_code || !generated_at || !strategy || !Number.isFinite(Number(max_len))) {
+        if (!campaign_id || !scenario_code || !generated_at || !strategy || !Number.isFinite(Number(max_len))) {
             return res.status(400).json({
                 ok: false,
-                error: "invalid body",
+                error: { code: "INVALID_BODY", message: "Missing required interlocking scenario fields" },
+                correlationId,
+            });
+        }
+
+        const campaignId = String(campaign_id).trim();
+        const campaignRes = await pool.query(
+            `
+            select id
+            from campaigns
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+              and status = 'campaign_closed'
+            limit 1
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+        if (!campaignRes.rows[0]) {
+            return res.status(400).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
                 correlationId,
             });
         }
@@ -3235,6 +3818,7 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
             insert into interlocking_scenarios (
               company_id,
               perimeter_id,
+              campaign_id,
               scenario_code,
               generated_at,
               strategy,
@@ -3251,10 +3835,11 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
               optimal_chains_json
             )
             values (
-              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15::jsonb, $16::jsonb
+              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb
             )
             returning
               id,
+              campaign_id,
               scenario_code,
               generated_at,
               strategy,
@@ -3274,6 +3859,7 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
             [
                 companyId,
                 perimeterId,
+                campaignId,
                 String(scenario_code),
                 generated_at,
                 String(strategy),
@@ -3296,9 +3882,15 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
         await audit(
             "interlocking_scenario_create",
             r.user.id,
-            { scenario_code: String(scenario_code) },
+            {
+                scenario_code: String(scenario_code),
+                campaign_id: campaignId,
+                company_id: companyId,
+                perimeter_id: perimeterId,
+            },
             { scenario },
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
 
         return res.status(201).json({
@@ -3310,15 +3902,22 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
         await audit(
             "interlocking_scenario_create",
             r.user.id,
-            { body: req.body ?? {} },
+            {
+                body: req.body ?? {},
+                company_id: companyId ?? null,
+                perimeter_id: perimeterId ?? null,
+            },
             { error: String(e?.message ?? e) },
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
 
         return res.status(500).json({
             ok: false,
-            error: "Create interlocking scenario failed",
-            detail: String(e?.message ?? e),
+            error: {
+                code: "INTERLOCKING_SCENARIO_CREATE_FAILED",
+                message: String(e?.message ?? e),
+            },
             correlationId,
         });
     }
@@ -3331,17 +3930,26 @@ adminRouter.post("/interlocking-scenarios", requireOperationalPerimeterAdmin, as
 adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response) => {
     const r = req as unknown as AuthedRequest;
     const correlationId = (req as any).correlationId;
+    const { companyId, perimeterId } = getTenantScope(req);
 
     try {
-        const { companyId, perimeterId } = getTenantScope(req);
         const ids = Array.isArray(req.body?.ids) ? req.body.ids.filter(Boolean) : [];
 
         if (ids.length === 0) {
             return res.status(400).json({
                 ok: false,
-                error: "ids required",
+                error: { code: "IDS_REQUIRED", message: "ids[] is required" },
                 correlationId,
             });
+        }
+
+        const campaignId = String((req.query as any)?.campaign_id ?? req.body?.campaign_id ?? "").trim();
+        let campaignFilterSql = "";
+        const params: unknown[] = [ids, companyId, perimeterId];
+
+        if (campaignId) {
+            campaignFilterSql = " and campaign_id = $4";
+            params.push(campaignId);
         }
 
         const del = await pool.query(
@@ -3350,8 +3958,9 @@ adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, 
             where id = any($1::uuid[])
               and company_id = $2
               and perimeter_id = $3
+              ${campaignFilterSql}
             `,
-            [ids, companyId, perimeterId]
+            params
         );
 
         const out = {
@@ -3362,9 +3971,10 @@ adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, 
         await audit(
             "interlocking_scenario_delete_many",
             r.user.id,
-            { ids },
+            { ids, company_id: companyId, perimeter_id: perimeterId, campaign_id: campaignId || null },
             out,
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
 
         return res.json({
@@ -3376,17 +3986,242 @@ adminRouter.delete("/interlocking-scenarios", requireOperationalPerimeterAdmin, 
         await audit(
             "interlocking_scenario_delete_many",
             r.user.id,
-            { ids: req.body?.ids ?? null },
+            {
+                ids: req.body?.ids ?? null,
+                company_id: companyId ?? null,
+                perimeter_id: perimeterId ?? null,
+            },
             { error: String(e?.message ?? e) },
-            correlationId
+            correlationId,
+            { companyId, perimeterId }
         );
 
         return res.status(500).json({
             ok: false,
-            error: "Delete interlocking scenarios failed",
-            detail: String(e?.message ?? e),
+            error: {
+                code: "INTERLOCKING_SCENARIO_DELETE_FAILED",
+                message: String(e?.message ?? e),
+            },
             correlationId,
         });
+    }
+});
+
+/**
+ * GET /api/admin/scenarios?campaign_id=...
+ * Alias campaign-scoped for interlocking scenarios.
+ */
+adminRouter.get("/scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const campaignId = String((req.query as any)?.campaign_id ?? "").trim();
+        if (!campaignId) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required" },
+                correlationId,
+            });
+        }
+        const { companyId, perimeterId } = getTenantScope(req);
+        const campaignRes = await pool.query(
+            `
+            select id
+            from campaigns
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+              and status = 'campaign_closed'
+            limit 1
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+        if (!campaignRes.rows[0]) {
+            return res.status(404).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
+                correlationId,
+            });
+        }
+
+        const { rows } = await pool.query(
+            `
+            select
+              id,
+              campaign_id,
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json,
+              created_at
+            from interlocking_scenarios
+            where company_id = $1
+              and perimeter_id = $2
+              and campaign_id = $3
+            order by generated_at desc, created_at desc
+            limit 500
+            `,
+            [companyId, perimeterId, campaignId]
+        );
+
+        return res.json({ ok: true, scenarios: rows, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * POST /api/admin/scenarios
+ * Alias for creating campaign-scoped interlocking scenarios.
+ */
+adminRouter.post("/scenarios", requireOperationalPerimeterAdmin, async (req: Request, res: Response, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const r = req as unknown as AuthedRequest;
+        const { companyId, perimeterId } = getTenantScope(req);
+        const {
+            campaign_id,
+            scenario_code,
+            generated_at,
+            strategy,
+            max_len,
+            total_chains,
+            unique_people,
+            coverage,
+            avg_length,
+            max_length,
+            avg_priority,
+            build_nodes,
+            build_relationships,
+            chains_json,
+            optimal_chains_json,
+        } = req.body ?? {};
+
+        if (!campaign_id || !scenario_code || !generated_at || !strategy || !Number.isFinite(Number(max_len))) {
+            return res.status(400).json({
+                ok: false,
+                error: { code: "INVALID_BODY", message: "Missing required interlocking scenario fields" },
+                correlationId,
+            });
+        }
+
+        const campaignId = String(campaign_id).trim();
+        const campaignRes = await pool.query(
+            `
+            select id
+            from campaigns
+            where id = $1
+              and company_id = $2
+              and perimeter_id = $3
+              and status = 'campaign_closed'
+            limit 1
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+        if (!campaignRes.rows[0]) {
+            return res.status(400).json({
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
+                correlationId,
+            });
+        }
+
+        const inserted = await pool.query(
+            `
+            insert into interlocking_scenarios (
+              company_id,
+              perimeter_id,
+              campaign_id,
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json
+            )
+            values (
+              $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16::jsonb, $17::jsonb
+            )
+            returning
+              id,
+              campaign_id,
+              scenario_code,
+              generated_at,
+              strategy,
+              max_len,
+              total_chains,
+              unique_people,
+              coverage,
+              avg_length,
+              max_length,
+              avg_priority,
+              build_nodes,
+              build_relationships,
+              chains_json,
+              optimal_chains_json,
+              created_at
+            `,
+            [
+                companyId,
+                perimeterId,
+                campaignId,
+                String(scenario_code),
+                generated_at,
+                String(strategy),
+                Number(max_len),
+                Number(total_chains ?? 0),
+                Number(unique_people ?? 0),
+                coverage ?? null,
+                avg_length ?? null,
+                max_length ?? null,
+                avg_priority ?? null,
+                build_nodes ?? null,
+                build_relationships ?? null,
+                JSON.stringify(Array.isArray(chains_json) ? chains_json : []),
+                JSON.stringify(optimal_chains_json ?? null),
+            ]
+        );
+
+        await audit(
+            "interlocking_scenario_create",
+            r.user.id,
+            {
+                scenario_code: String(scenario_code),
+                campaign_id: campaignId,
+                company_id: companyId,
+                perimeter_id: perimeterId,
+            },
+            { scenario: inserted.rows?.[0] ?? null },
+            correlationId,
+            { companyId, perimeterId }
+        );
+
+        return res.status(201).json({ ok: true, scenario: inserted.rows?.[0] ?? null, correlationId });
+    } catch (e) {
+        next(e);
     }
 });
 
@@ -3411,6 +4246,88 @@ adminRouter.get("/campaigns", requireOperationalPerimeterAdmin, async (req, res,
             [companyId, perimeterId]
         );
         return res.json({ ok: true, campaigns: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * GET /api/admin/campaigns/:campaignId
+ * Returns one campaign (scoped to current perimeter) and its archived applications snapshot.
+ */
+adminRouter.get("/campaigns/:campaignId", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const { companyId, perimeterId } = getTenantScope(req);
+        const campaignId = String(req.params.campaignId ?? "");
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId: (req as any).correlationId });
+        }
+        if (!campaignId) {
+            return res.status(400).json({ ok: false, error: "CAMPAIGN_ID_REQUIRED", correlationId: (req as any).correlationId });
+        }
+
+        const campaignRes = await pool.query(
+            `SELECT id, status, reservations_opened_at, reservations_closed_at,
+                    campaign_opened_at, campaign_closed_at, reserved_users_count,
+                    total_applications_count, created_at
+             FROM campaigns
+             WHERE id = $1 AND company_id = $2 AND perimeter_id = $3
+             LIMIT 1`,
+            [campaignId, companyId, perimeterId]
+        );
+        const campaign = campaignRes.rows[0] ?? null;
+        if (!campaign) {
+            return res.status(404).json({
+                ok: false,
+                error: "CAMPAIGN_NOT_FOUND",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+
+        const snapshotRes = await pool.query(
+            `
+            SELECT
+              cas.id,
+              cas.user_id,
+              cas.position_id,
+              p.title as position_title,
+              cas.target_user_id,
+              cas.priority,
+              cas.original_created_at,
+              cas.snapshot_at,
+              cand.full_name as candidate_full_name,
+              cand_role.name as candidate_role_name,
+              cand_loc.name as candidate_location_name,
+              cand_dept.name as candidate_department_name,
+              tgt.full_name as target_full_name,
+              tgt_role.name as target_role_name,
+              tgt_loc.name as target_location_name,
+              tgt_dept.name as target_department_name
+            FROM campaign_applications_snapshot cas
+            LEFT JOIN positions p ON p.id = cas.position_id
+            LEFT JOIN users cand ON cand.id = cas.user_id
+            LEFT JOIN roles cand_role ON cand_role.id = cand.role_id
+            LEFT JOIN locations cand_loc ON cand_loc.id = cand.location_id
+            LEFT JOIN departments cand_dept ON cand_dept.id = cand.department_id
+            LEFT JOIN users tgt ON tgt.id = cas.target_user_id
+            LEFT JOIN roles tgt_role ON tgt_role.id = tgt.role_id
+            LEFT JOIN locations tgt_loc ON tgt_loc.id = tgt.location_id
+            LEFT JOIN departments tgt_dept ON tgt_dept.id = tgt.department_id
+            WHERE cas.campaign_id = $1
+              AND cas.company_id = $2
+              AND cas.perimeter_id = $3
+            ORDER BY cas.priority ASC NULLS LAST, cas.original_created_at ASC NULLS LAST, cas.id ASC
+            LIMIT 2000
+            `,
+            [campaignId, companyId, perimeterId]
+        );
+
+        return res.json({
+            ok: true,
+            campaign,
+            applications: snapshotRes.rows,
+            correlationId: (req as any).correlationId ?? null,
+        });
     } catch (e) {
         next(e);
     }

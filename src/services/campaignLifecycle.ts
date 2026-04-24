@@ -261,8 +261,12 @@ export async function closeCampaign(
   const campaignId = lifecycle.campaignId!;
 
   const appCountRes = await client.query<{ cnt: string }>(
-    `SELECT count(*)::text as cnt FROM applications WHERE company_id = $1 AND perimeter_id = $2`,
-    [companyId, perimeterId]
+    `SELECT count(*)::text as cnt
+     FROM applications
+     WHERE company_id = $1
+       AND perimeter_id = $2
+       AND campaign_id = $3`,
+    [companyId, perimeterId, campaignId]
   );
   const totalApplications = Number(appCountRes.rows[0]?.cnt ?? 0);
 
@@ -273,13 +277,13 @@ export async function closeCampaign(
             p.occupied_by, a.priority, a.created_at
      FROM applications a
      LEFT JOIN positions p ON p.id = a.position_id
-     WHERE a.company_id = $2 AND a.perimeter_id = $3`,
+     WHERE a.company_id = $2 AND a.perimeter_id = $3 AND a.campaign_id = $1`,
     [campaignId, companyId, perimeterId]
   );
 
   const deletedApplications = await client.query(
-    `DELETE FROM applications WHERE company_id = $1 AND perimeter_id = $2`,
-    [companyId, perimeterId]
+    `DELETE FROM applications WHERE company_id = $1 AND perimeter_id = $2 AND campaign_id = $3`,
+    [companyId, perimeterId, campaignId]
   );
 
   const usersReset = await client.query(

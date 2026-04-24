@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { requireAuth } from "../auth.js";
 import { supabaseAdmin, pool } from "../db.js";
+import { deriveUserState, getCampaignStatus } from "../services/campaignLifecycle.js";
 export const mapRouter = Router();
 const MAP_CACHE_TTL_MS = Number(process.env.MAP_CACHE_TTL_MS ?? 15_000); // 15s default
 const mapCache = new Map();
@@ -66,26 +67,26 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         return res.json(cached);
     }
     try {
-        // 1) app_config + campaign_status (parallel)
-        const [{ data: config, error: configErr }, perimeterRes] = await Promise.all([
-            supabaseAdmin
-                .from("app_config")
-                .select("max_applications")
-                .eq("company_id", access.currentCompanyId)
-                .eq("perimeter_id", access.currentPerimeterId)
-                .single(),
-            pool.query(`select campaign_status from perimeters where id = $1 limit 1`, [access.currentPerimeterId]),
+        // 1) app_config + campaign/reservation statuses (parallel)
+        // Use pool.query for app_config — supabase .single() throws PGRST116 when no row exists
+        // for perimeters created after the phase2 backfill (platform.ts didn't upsert app_config).
+        const [configRes, campaignStatusRes] = await Promise.all([
+            pool.query(`select max_applications from app_config where singleton = true and company_id = $1 and perimeter_id = $2 limit 1`, [access.currentCompanyId, access.currentPerimeterId]),
+            getCampaignStatus(access.currentCompanyId, access.currentPerimeterId),
         ]);
-        if (configErr)
-            throw configErr;
-        const campaignStatus = perimeterRes.rows[0]?.campaign_status === "open" ? "open" : "closed";
+        const config = configRes.rows[0] ?? null;
+        const campaignStatus = campaignStatusRes.campaign_status;
+        const reservationsStatus = campaignStatusRes.reservations_status;
         // 2) viewer user (status + coords via locations)
+        // No company/perimeter filter: user uniquely identified by id; tenant scope enforced by middleware.
+        // Filtering by perimeter_id breaks users whose users.perimeter_id doesn't match the active context.
         const { data: me, error: meErr } = await supabaseAdmin
             .from("users")
             .select(`
         id,
         role_id,
         availability_status,
+        is_reserved,
         location_id,
         locations:location_id (
           latitude,
@@ -93,8 +94,6 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         )
       `)
             .eq("id", viewerUserId)
-            .eq("company_id", access.currentCompanyId)
-            .eq("perimeter_id", access.currentPerimeterId)
             .single();
         if (meErr)
             throw meErr;
@@ -200,6 +199,10 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         roles:role_id (
           name
         ),
+        department_id,
+        departments:department_id (
+          name
+        ),
         location_id,
         locations:location_id (
           id,
@@ -232,6 +235,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 continue;
             const roleId = u.role_id ?? "unknown";
             const roleName = u.roles?.name ?? "—";
+            const departmentId = u.department_id ?? null;
+            const departmentObj = Array.isArray(u.departments)
+                ? u.departments[0]
+                : u.departments;
+            const departmentName = departmentObj?.name ?? null;
+            const groupKey = `${roleId}__${departmentId ?? "null"}`;
             // Regola business: nascondi posizioni con stesso ruolo + stessa sede del viewer.
             if (me?.role_id &&
                 me?.location_id &&
@@ -249,10 +258,13 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 };
             }
             const isFixed = !!u.fixed_location;
-            if (!byLocation[loc.id].roles[roleId]) {
-                byLocation[loc.id].roles[roleId] = {
+            if (!byLocation[loc.id].roles[groupKey]) {
+                byLocation[loc.id].roles[groupKey] = {
+                    group_key: groupKey,
                     role_id: roleId,
                     role_name: roleName,
+                    department_id: departmentId,
+                    department_name: departmentName,
                     fixed_location: isFixed,
                     applied: false,
                     priority: null,
@@ -262,20 +274,20 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             else {
                 // role is fixed if ANY occupant has fixed_location = true
                 if (isFixed)
-                    byLocation[loc.id].roles[roleId].fixed_location = true;
+                    byLocation[loc.id].roles[groupKey].fixed_location = true;
             }
-            byLocation[loc.id].roles[roleId].users.push({
+            byLocation[loc.id].roles[groupKey].users.push({
                 id: u.id,
                 full_name: u.full_name,
                 position_id: positionId, // ✅ SEMPRE positions.id
             });
             // applied/priority coerenti col mode (relatedUserIds contiene user_id)
             if (relatedUserIds.includes(u.id)) {
-                byLocation[loc.id].roles[roleId].applied = true;
+                byLocation[loc.id].roles[groupKey].applied = true;
                 const pBest = userPriorityMap[u.id];
                 if (pBest != null) {
-                    const prev = byLocation[loc.id].roles[roleId].priority;
-                    byLocation[loc.id].roles[roleId].priority = prev == null ? pBest : Math.min(prev, pBest);
+                    const prev = byLocation[loc.id].roles[groupKey].priority;
+                    byLocation[loc.id].roles[groupKey].priority = prev == null ? pBest : Math.min(prev, pBest);
                 }
             }
         }
@@ -293,15 +305,21 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
             viewerRoleId: me?.role_id ?? null,
             viewerLocationId: me?.location_id ?? null,
             campaign_status: campaignStatus,
-            myStatus: (me.availability_status ?? "inactive").toString().toLowerCase() === "available"
-                ? "available"
-                : "inactive",
+            reservations_status: reservationsStatus,
+            user_state: deriveUserState({
+                availabilityStatus: me?.availability_status ?? "inactive",
+                isReserved: me?.is_reserved ?? false,
+            }),
+            myStatus: deriveUserState({
+                availabilityStatus: me?.availability_status ?? "inactive",
+                isReserved: me?.is_reserved ?? false,
+            }),
             companyId: access.currentCompanyId,
             companyName: access.currentCompanyName,
             perimeterId: access.currentPerimeterId,
             perimeterName: access.currentPerimeterName,
             meLocation: lat != null && lng != null ? { latitude: lat + OFFSET, longitude: lng + OFFSET } : null,
-            maxApplications: config.max_applications,
+            maxApplications: config?.max_applications ?? 3,
             usedPriorities: Array.from(new Set(usedPriorities)),
             locations,
         };
