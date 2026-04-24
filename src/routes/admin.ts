@@ -712,35 +712,47 @@ adminRouter.post(
                     [scenarioId, companyId, perimeterId]
                 );
 
-                await client.query(
-                    `
-                    insert into test_scenario_initialized_users
-                      (company_id, perimeter_id, campaign_id, scenario_id, user_id)
-                    select distinct $2, $3, $4, $1, x.user_id
-                    from (
-                      select tsa.user_id
-                      from test_scenario_applications tsa
-                      where tsa.scenario_id = $1
-                        and tsa.company_id = $2
-                        and tsa.perimeter_id = $3
+                // Backward-compatible: tracking table may be missing in environments where
+                // the latest migration has not yet been applied.
+                const tsiuColumns = await getTableColumns(client, "test_scenario_initialized_users");
+                if (
+                    tsiuColumns.size > 0
+                    && tsiuColumns.has("company_id")
+                    && tsiuColumns.has("perimeter_id")
+                    && tsiuColumns.has("campaign_id")
+                    && tsiuColumns.has("scenario_id")
+                    && tsiuColumns.has("user_id")
+                ) {
+                    await client.query(
+                        `
+                        insert into test_scenario_initialized_users
+                          (company_id, perimeter_id, campaign_id, scenario_id, user_id)
+                        select distinct $2, $3, $4, $1, x.user_id
+                        from (
+                          select tsa.user_id
+                          from test_scenario_applications tsa
+                          where tsa.scenario_id = $1
+                            and tsa.company_id = $2
+                            and tsa.perimeter_id = $3
 
-                      union
+                          union
 
-                      select p.occupied_by as user_id
-                      from test_scenario_applications tsa
-                      join positions p on p.id = tsa.position_id
-                      where tsa.scenario_id = $1
-                        and tsa.company_id = $2
-                        and tsa.perimeter_id = $3
-                        and p.occupied_by is not null
-                    ) x
-                    on conflict (company_id, perimeter_id, campaign_id, user_id)
-                    do update set
-                      scenario_id = excluded.scenario_id,
-                      initialized_at = now()
-                    `,
-                    [scenarioId, companyId, perimeterId, activeCampaignId]
-                );
+                          select p.occupied_by as user_id
+                          from test_scenario_applications tsa
+                          join positions p on p.id = tsa.position_id
+                          where tsa.scenario_id = $1
+                            and tsa.company_id = $2
+                            and tsa.perimeter_id = $3
+                            and p.occupied_by is not null
+                        ) x
+                        on conflict (company_id, perimeter_id, campaign_id, user_id)
+                        do update set
+                          scenario_id = excluded.scenario_id,
+                          initialized_at = now()
+                        `,
+                        [scenarioId, companyId, perimeterId, activeCampaignId]
+                    );
+                }
 
                 await client.query(`
                     update users u
@@ -768,9 +780,35 @@ adminRouter.post(
                       )
                 `, [companyId, perimeterId, activeCampaignId]);
 
+                // Business rule: initializing a test scenario while campaign is open
+                // must overwrite reservation counts with the current initialized state.
+                const reservedUsersRes = await client.query<{ cnt: string }>(
+                    `
+                    select count(*)::text as cnt
+                    from users
+                    where company_id = $1
+                      and coalesce(perimeter_id, home_perimeter_id) = $2
+                      and (
+                        coalesce(is_reserved, false) = true
+                        or availability_status = 'available'
+                      )
+                    `,
+                    [companyId, perimeterId]
+                );
+                const reservedUsersCount = Number(reservedUsersRes.rows[0]?.cnt ?? 0);
+                await client.query(
+                    `
+                    update campaigns
+                    set reserved_users_count = $2
+                    where id = $1
+                    `,
+                    [activeCampaignId, reservedUsersCount]
+                );
+
                 return {
                     insertedApplications: insertedApplications.rowCount ?? 0,
                     activatedUsers: forcedAvailable.rowCount ?? 0,
+                    reservedUsersCount,
                 };
             });
 
@@ -795,14 +833,15 @@ adminRouter.post(
 
             return res.status(200).json({ ok: true, result, correlationId });
         } catch (e: any) {
+            const message = String(e?.message ?? e);
             await audit(
                 "scenario_initialize",
                 r.user.id,
                 { scenarioId },
-                { error: String(e?.message ?? e) },
+                { error: message },
                 correlationId
             );
-            return res.status(500).json({ error: "Initialize failed", correlationId });
+            return res.status(500).json({ ok: false, error: message || "Initialize failed", correlationId });
         }
     }
 );
