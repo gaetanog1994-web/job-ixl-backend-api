@@ -2474,71 +2474,122 @@ adminRouter.get("/roles", async (req, res, next) => {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
         }
 
-        const rolesRes = await pool.query(
+        const roleColumns = await pool.query<{ column_name: string }>(
             `
-            with scoped_roles as (
-              select r.id, r.name
-              from roles r
-              where (
-                    r.company_id = $1
-                and r.perimeter_id = $2
-              )
-                 or (
-                    (r.company_id is null or r.perimeter_id is null)
-                and exists (
-                      select 1
-                      from users u_scope
-                      where u_scope.role_id = r.id
-                        and u_scope.company_id = $1
-                        and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+            select column_name
+            from information_schema.columns
+            where table_schema = 'public'
+              and table_name = 'roles'
+            `
+        );
+        const roleCols = new Set(roleColumns.rows.map((r) => r.column_name));
+        const hasRoleTenantScope = roleCols.has("company_id") && roleCols.has("perimeter_id");
+
+        const rolesRes = await pool.query(
+            hasRoleTenantScope
+                ? `
+                  with scoped_roles as (
+                    select r.id, r.name
+                    from roles r
+                    where (
+                          r.company_id = $1
+                      and r.perimeter_id = $2
                     )
-                 )
-            )
-            select
-              sr.id,
-              sr.name,
-              count(distinct u.id)::int as assigned_users_count
-            from scoped_roles sr
-            left join users u
-              on u.role_id = sr.id
-             and u.company_id = $1
-             and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
-            group by sr.id, sr.name
-            order by sr.name asc
-            `,
+                       or (
+                          (r.company_id is null or r.perimeter_id is null)
+                      and exists (
+                            select 1
+                            from users u_scope
+                            where u_scope.role_id = r.id
+                              and u_scope.company_id = $1
+                              and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                          )
+                       )
+                  )
+                  select
+                    sr.id,
+                    sr.name,
+                    count(distinct u.id)::int as assigned_users_count
+                  from scoped_roles sr
+                  left join users u
+                    on u.role_id = sr.id
+                   and u.company_id = $1
+                   and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+                  group by sr.id, sr.name
+                  order by sr.name asc
+                  `
+                : `
+                  with scoped_roles as (
+                    select distinct r.id, r.name
+                    from roles r
+                    join users u_scope on u_scope.role_id = r.id
+                    where u_scope.company_id = $1
+                      and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                  )
+                  select
+                    sr.id,
+                    sr.name,
+                    count(distinct u.id)::int as assigned_users_count
+                  from scoped_roles sr
+                  left join users u
+                    on u.role_id = sr.id
+                   and u.company_id = $1
+                   and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+                  group by sr.id, sr.name
+                  order by sr.name asc
+                  `,
             [companyId, perimeterId]
         );
 
         const compatRes = await pool.query(
-            `
-            with scoped_roles as (
-              select r.id
-              from roles r
-              where (
-                    r.company_id = $1
-                and r.perimeter_id = $2
-              )
-                 or (
-                    (r.company_id is null or r.perimeter_id is null)
-                and exists (
-                      select 1
-                      from users u_scope
-                      where u_scope.role_id = r.id
-                        and u_scope.company_id = $1
-                        and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+            hasRoleTenantScope
+                ? `
+                  with scoped_roles as (
+                    select r.id
+                    from roles r
+                    where (
+                          r.company_id = $1
+                      and r.perimeter_id = $2
                     )
-                 )
-            )
-            select
-              rc.role_id,
-              rc.compatible_role_id,
-              cr.name as compatible_role_name
-            from role_compatibilities rc
-            join roles cr on cr.id = rc.compatible_role_id
-            join scoped_roles left_role on left_role.id = rc.role_id
-            join scoped_roles right_role on right_role.id = rc.compatible_role_id
-            order by cr.name asc
-            `,
+                       or (
+                          (r.company_id is null or r.perimeter_id is null)
+                      and exists (
+                            select 1
+                            from users u_scope
+                            where u_scope.role_id = r.id
+                              and u_scope.company_id = $1
+                              and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                          )
+                       )
+                  )
+                  select
+                    rc.role_id,
+                    rc.compatible_role_id,
+                    cr.name as compatible_role_name
+                  from role_compatibilities rc
+                  join roles cr on cr.id = rc.compatible_role_id
+                  join scoped_roles left_role on left_role.id = rc.role_id
+                  join scoped_roles right_role on right_role.id = rc.compatible_role_id
+                  order by cr.name asc
+                  `
+                : `
+                  with scoped_roles as (
+                    select distinct r.id
+                    from roles r
+                    join users u_scope on u_scope.role_id = r.id
+                    where u_scope.company_id = $1
+                      and coalesce(u_scope.perimeter_id, u_scope.home_perimeter_id) = $2
+                  )
+                  select
+                    rc.role_id,
+                    rc.compatible_role_id,
+                    cr.name as compatible_role_name
+                  from role_compatibilities rc
+                  join roles cr on cr.id = rc.compatible_role_id
+                  join scoped_roles left_role on left_role.id = rc.role_id
+                  join scoped_roles right_role on right_role.id = rc.compatible_role_id
+                  order by cr.name asc
+                  `,
             [companyId, perimeterId]
         );
 
