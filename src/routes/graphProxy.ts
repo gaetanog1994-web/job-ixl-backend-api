@@ -91,14 +91,28 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
         // 1) prima prova
         let resp = await doFetch(targetUrl);
 
-        // 2) fallback compatibilità path prefix /api
+        // 2) fallback compatibilità path prefix (/api) e root paths
         if (resp.status === 404) {
             const fallbackCandidates: URL[] = [];
+            const rootPath = `${forwardPath}`.replace(/\/{2,}/g, "/");
+            const rootApiPath = `/api${forwardPath}`.replace(/\/{2,}/g, "/");
+            const scopedRootPath = `${basePath}${forwardPath}`.replace(/\/{2,}/g, "/");
+            const scopedApiPath = `${basePath}/api${forwardPath}`.replace(/\/{2,}/g, "/");
+
+            // Probe order:
+            // 1) root path (graph-service standard)
+            // 2) root + /api prefix
+            // 3) scoped base path
+            // 4) scoped base path + /api prefix
+            fallbackCandidates.push(new URL(rootPath, `${graphServiceOrigin}/`));
             if (!forwardPath.startsWith("/api/")) {
-                const scopedApiPath = `${basePath}/api${forwardPath}`.replace(/\/{2,}/g, "/");
-                const rootApiPath = `/api${forwardPath}`;
-                fallbackCandidates.push(new URL(scopedApiPath, `${graphServiceOrigin}/`));
                 fallbackCandidates.push(new URL(rootApiPath, `${graphServiceOrigin}/`));
+            }
+            if (scopedRootPath !== rootPath) {
+                fallbackCandidates.push(new URL(scopedRootPath, `${graphServiceOrigin}/`));
+            }
+            if (!forwardPath.startsWith("/api/") && scopedApiPath !== rootApiPath) {
+                fallbackCandidates.push(new URL(scopedApiPath, `${graphServiceOrigin}/`));
             }
             for (const fallback of fallbackCandidates) {
                 fallback.search = targetUrl.search;
