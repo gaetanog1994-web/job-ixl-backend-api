@@ -30,11 +30,13 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
 
         const baseUrl = new URL(GRAPH_SERVICE_URL);
         const graphServiceOrigin = `${baseUrl.protocol}//${baseUrl.host}`;
+        const basePath = baseUrl.pathname.replace(/\/+$/, "");
         let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
 
         if (forwardPath === "/warmup") forwardPath = "/neo4j/warmup";
 
-        const targetUrl = new URL(forwardPath, `${graphServiceOrigin}/`);
+        const withBasePath = `${basePath}${forwardPath}`.replace(/\/{2,}/g, "/");
+        const targetUrl = new URL(withBasePath, `${graphServiceOrigin}/`);
         const isCriticalGraphOperation =
             forwardPath === "/neo4j/warmup" ||
             forwardPath === "/graph/chains" ||
@@ -89,11 +91,20 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
         // 1) prima prova
         let resp = await doFetch(targetUrl);
 
-        // 2) fallback /api se 404 (utile per future routes)
-        if (resp.status === 404 && !forwardPath.startsWith("/api/")) {
-            const fallback = new URL(`/api${forwardPath}`, `${graphServiceOrigin}/`);
-            fallback.search = targetUrl.search;
-            resp = await doFetch(fallback);
+        // 2) fallback compatibilità path prefix /api
+        if (resp.status === 404) {
+            const fallbackCandidates: URL[] = [];
+            if (!forwardPath.startsWith("/api/")) {
+                const scopedApiPath = `${basePath}/api${forwardPath}`.replace(/\/{2,}/g, "/");
+                const rootApiPath = `/api${forwardPath}`;
+                fallbackCandidates.push(new URL(scopedApiPath, `${graphServiceOrigin}/`));
+                fallbackCandidates.push(new URL(rootApiPath, `${graphServiceOrigin}/`));
+            }
+            for (const fallback of fallbackCandidates) {
+                fallback.search = targetUrl.search;
+                resp = await doFetch(fallback);
+                if (resp.status !== 404) break;
+            }
         }
 
         const text = await resp.text();
