@@ -33,7 +33,10 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
         const basePath = baseUrl.pathname.replace(/\/+$/, "");
         let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
 
+        if (forwardPath === "/chains") forwardPath = "/graph/chains";
+        if (forwardPath === "/summary") forwardPath = "/graph/summary";
         if (forwardPath === "/warmup") forwardPath = "/neo4j/warmup";
+
 
         const withBasePath = `${basePath}${forwardPath}`.replace(/\/{2,}/g, "/");
         const targetUrl = new URL(withBasePath, `${graphServiceOrigin}/`);
