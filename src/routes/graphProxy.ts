@@ -28,12 +28,13 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
             });
         }
 
-        const base = GRAPH_SERVICE_URL.replace(/\/+$/, "");
+        const baseUrl = new URL(GRAPH_SERVICE_URL);
+        const graphServiceOrigin = `${baseUrl.protocol}//${baseUrl.host}`;
         let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
 
         if (forwardPath === "/warmup") forwardPath = "/neo4j/warmup";
 
-        const targetUrl = new URL(`${base}${forwardPath}`);
+        const targetUrl = new URL(forwardPath, `${graphServiceOrigin}/`);
         const isCriticalGraphOperation =
             forwardPath === "/neo4j/warmup" ||
             forwardPath === "/graph/chains" ||
@@ -90,7 +91,7 @@ graphProxyRouter.use(async (req: Request, res: Response) => {
 
         // 2) fallback /api se 404 (utile per future routes)
         if (resp.status === 404 && !forwardPath.startsWith("/api/")) {
-            const fallback = new URL(`${base}/api${forwardPath}`);
+            const fallback = new URL(`/api${forwardPath}`, `${graphServiceOrigin}/`);
             fallback.search = targetUrl.search;
             resp = await doFetch(fallback);
         }
