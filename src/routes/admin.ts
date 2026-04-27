@@ -1487,8 +1487,8 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
         occ.full_name as occupant_full_name,
         occ_role.name as occupant_role_name,
         occ_loc.name as occupant_location_name,
-        occ.department_id as target_department_id,
-        target_dpt.name as target_department_name,
+        occ.org_unit_id as target_org_unit_id,
+        target_ou.name as target_org_unit_name,
         coalesce(
           (
             select json_agg(
@@ -1529,7 +1529,7 @@ adminRouter.get("/candidatures", requireOperationalPerimeterAdmin, async (req, r
 
       left join roles occ_role on occ_role.id = occ.role_id
       left join locations occ_loc on occ_loc.id = occ.location_id
-      left join departments target_dpt on target_dpt.id = occ.department_id
+      left join organizational_units target_ou on target_ou.id = occ.org_unit_id
 
       where a.company_id = $1
         and a.perimeter_id = $2
@@ -1653,8 +1653,8 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
         u.fixed_location,
         u.role_id,
         r.name as role_name,
-        u.department_id,
-        dpt.name as department_name,
+        u.org_unit_id,
+        ou.name as org_unit_name,
         pm.access_role,
         u.application_count,
         coalesce(
@@ -1691,7 +1691,7 @@ adminRouter.get("/users", requireOperationalPerimeterAdmin, async (req, res, nex
       join users u on u.id = pm.user_id
       left join locations l on l.id = u.location_id
       left join roles r on r.id = u.role_id
-      left join departments dpt on dpt.id = u.department_id
+      left join organizational_units ou on ou.id = u.org_unit_id
       where pm.company_id = $1
         and pm.perimeter_id = $2
         and u.company_id = $1
@@ -2154,8 +2154,8 @@ adminRouter.get("/users/:id", requireOperationalPerimeterAdmin, async (req, res,
               u.fixed_location,
               u.role_id,
               r.name as role_name,
-              u.department_id,
-              dpt.name as department_name,
+              u.org_unit_id,
+              ou.name as org_unit_name,
               pm.access_role,
               u.application_count,
               coalesce(
@@ -2190,7 +2190,7 @@ adminRouter.get("/users/:id", requireOperationalPerimeterAdmin, async (req, res,
             join users u on u.id = pm.user_id
             left join locations l on l.id = u.location_id
             left join roles r on r.id = u.role_id
-            left join departments dpt on dpt.id = u.department_id
+            left join organizational_units ou on ou.id = u.org_unit_id
             where pm.company_id = $1
               and pm.perimeter_id = $2
               and u.company_id = $1
@@ -2248,7 +2248,7 @@ adminRouter.patch("/users/:id", requireOperationalPerimeterAdmin, async (req, re
             last_name,
             email,
             role_id,
-            department_id,
+            org_unit_id,
             location_id,
             fixed_location,
             access_role,
@@ -2307,7 +2307,7 @@ adminRouter.patch("/users/:id", requireOperationalPerimeterAdmin, async (req, re
             }
             push("email", normalizedEmail);
         }
-        if (department_id !== undefined) push("department_id", department_id || null);
+        if (org_unit_id !== undefined) push("org_unit_id", org_unit_id || null);
         if (location_id !== undefined) push("location_id", location_id || null);
         if (fixed_location !== undefined) push("fixed_location", !!fixed_location);
         if (role_id !== undefined) push("role_id", role_id || null);
@@ -2348,7 +2348,7 @@ adminRouter.patch("/users/:id", requireOperationalPerimeterAdmin, async (req, re
       where id = $${i}
         and company_id = $${i + 1}
         and coalesce(perimeter_id, home_perimeter_id) = $${i + 2}
-      returning id, first_name, last_name, full_name, email, availability_status, location_id, fixed_location, role_id, department_id, company_id, perimeter_id
+      returning id, first_name, last_name, full_name, email, availability_status, location_id, fixed_location, role_id, org_unit_id, company_id, perimeter_id
       `,
             values
         ) : { rows: [] as any[] };
@@ -2956,6 +2956,43 @@ adminRouter.delete("/roles/:id/compatibility/:targetId", requireOperationalPerim
     }
 });
 
+// ─── org-units CRUD (hierarchical organizational structure) ───────────────────
+
+adminRouter.get("/org-units", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const { rows } = await pool.query(
+            `
+            select
+              ou.id,
+              ou.name,
+              ou.parent_id,
+              ou.level,
+              count(u.id)::int as assigned_users_count
+            from organizational_units ou
+            left join users u
+              on u.org_unit_id = ou.id
+             and u.company_id = $1
+             and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
+            where ou.company_id = $1
+              and ou.perimeter_id = $2
+            group by ou.id, ou.name, ou.parent_id, ou.level
+            order by ou.level asc, ou.name asc
+            `,
+            [companyId, perimeterId]
+        );
+
+        return res.json({ ok: true, org_units: rows, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+// Backward compat alias
 adminRouter.get("/departments", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
@@ -2966,28 +3003,79 @@ adminRouter.get("/departments", requireOperationalPerimeterAdmin, async (req, re
         const { rows } = await pool.query(
             `
             select
-              d.id,
-              d.name,
+              ou.id,
+              ou.name,
+              ou.parent_id,
+              ou.level,
               count(u.id)::int as assigned_users_count
-            from departments d
+            from organizational_units ou
             left join users u
-              on u.department_id = d.id
+              on u.org_unit_id = ou.id
              and u.company_id = $1
              and coalesce(u.perimeter_id, u.home_perimeter_id) = $2
-            where d.company_id = $1
-              and d.perimeter_id = $2
-            group by d.id, d.name
-            order by d.name asc
+            where ou.company_id = $1
+              and ou.perimeter_id = $2
+            group by ou.id, ou.name, ou.parent_id, ou.level
+            order by ou.level asc, ou.name asc
             `,
             [companyId, perimeterId]
         );
 
-        return res.json({ ok: true, departments: rows, correlationId });
+        return res.json({ ok: true, departments: rows, org_units: rows, correlationId });
     } catch (e) {
         next(e);
     }
 });
 
+adminRouter.post("/org-units", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) {
+            return res.status(400).json({ ok: false, error: "missing name", correlationId });
+        }
+        const parentId = req.body?.parent_id ? String(req.body.parent_id).trim() : null;
+
+        let level = 1;
+        if (parentId) {
+            const parentRes = await pool.query(
+                `select level from organizational_units where id = $1 and company_id = $2 and perimeter_id = $3 limit 1`,
+                [parentId, companyId, perimeterId]
+            );
+            if (!parentRes.rows[0]) {
+                return res.status(404).json({ ok: false, error: "PARENT_NOT_FOUND", correlationId });
+            }
+            level = (parentRes.rows[0].level ?? 1) + 1;
+        }
+
+        const { rows } = await pool.query(
+            `
+            insert into organizational_units (company_id, perimeter_id, name, parent_id, level)
+            values ($1, $2, $3, $4, $5)
+            returning id, name, parent_id, level
+            `,
+            [companyId, perimeterId, name, parentId, level]
+        );
+        await audit("org_unit_create", (req as any).user?.id, { name, parentId, level, companyId, perimeterId }, rows[0], correlationId);
+        return res.status(201).json({ ok: true, org_unit: rows[0] ?? null, correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({
+                ok: false,
+                error: "ORG_UNIT_ALREADY_EXISTS",
+                message: "Esiste già un'unità con questo nome.",
+                correlationId: (req as any).correlationId ?? null,
+            });
+        }
+        next(e);
+    }
+});
+
+// Backward compat alias (root node only, no parent_id)
 adminRouter.post("/departments", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
@@ -2999,21 +3087,33 @@ adminRouter.post("/departments", requireOperationalPerimeterAdmin, async (req, r
         if (!name) {
             return res.status(400).json({ ok: false, error: "missing name", correlationId });
         }
+        const parentId = req.body?.parent_id ? String(req.body.parent_id).trim() : null;
+        let level = 1;
+        if (parentId) {
+            const parentRes = await pool.query(
+                `select level from organizational_units where id = $1 and company_id = $2 and perimeter_id = $3 limit 1`,
+                [parentId, companyId, perimeterId]
+            );
+            if (!parentRes.rows[0]) {
+                return res.status(404).json({ ok: false, error: "PARENT_NOT_FOUND", correlationId });
+            }
+            level = (parentRes.rows[0].level ?? 1) + 1;
+        }
         const { rows } = await pool.query(
             `
-            insert into departments (company_id, perimeter_id, name)
-            values ($1, $2, $3)
-            returning id, name
+            insert into organizational_units (company_id, perimeter_id, name, parent_id, level)
+            values ($1, $2, $3, $4, $5)
+            returning id, name, parent_id, level
             `,
-            [companyId, perimeterId, name]
+            [companyId, perimeterId, name, parentId, level]
         );
-        return res.status(201).json({ ok: true, department: rows[0] ?? null, correlationId });
+        return res.status(201).json({ ok: true, department: rows[0] ?? null, org_unit: rows[0] ?? null, correlationId });
     } catch (e: any) {
         if (String(e?.code ?? "") === "23505") {
             return res.status(409).json({
                 ok: false,
-                error: "DEPARTMENT_ALREADY_EXISTS",
-                message: "Esiste già un reparto con questo nome.",
+                error: "ORG_UNIT_ALREADY_EXISTS",
+                message: "Esiste già un'unità con questo nome.",
                 correlationId: (req as any).correlationId ?? null,
             });
         }
@@ -3021,10 +3121,10 @@ adminRouter.post("/departments", requireOperationalPerimeterAdmin, async (req, r
     }
 });
 
-adminRouter.patch("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+adminRouter.patch("/org-units/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
-        const departmentId = String(req.params.id ?? "").trim();
+        const orgUnitId = String(req.params.id ?? "").trim();
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
@@ -3033,27 +3133,67 @@ adminRouter.patch("/departments/:id", requireOperationalPerimeterAdmin, async (r
         if (!name) {
             return res.status(400).json({ ok: false, error: "missing name", correlationId });
         }
+        const parentId = req.body?.parent_id !== undefined
+            ? (req.body.parent_id ? String(req.body.parent_id).trim() : null)
+            : undefined;
+
+        const fields: string[] = ["name = $1"];
+        const values: any[] = [name, orgUnitId, companyId, perimeterId];
+
+        if (parentId !== undefined) {
+            // Prevent circular hierarchy: new parent must not be a descendant of this node
+            if (parentId) {
+                const cycleCheck = await pool.query(
+                    `
+                    with recursive descendants as (
+                      select id from organizational_units where id = $1
+                      union all
+                      select ou.id from organizational_units ou
+                      join descendants d on d.id = ou.parent_id
+                    )
+                    select 1 from descendants where id = $2 limit 1
+                    `,
+                    [orgUnitId, parentId]
+                );
+                if ((cycleCheck.rowCount ?? 0) > 0) {
+                    return res.status(409).json({ ok: false, error: "CIRCULAR_HIERARCHY", correlationId });
+                }
+                const parentRes = await pool.query(
+                    `select level from organizational_units where id = $1 and company_id = $2 and perimeter_id = $3 limit 1`,
+                    [parentId, companyId, perimeterId]
+                );
+                if (!parentRes.rows[0]) {
+                    return res.status(404).json({ ok: false, error: "PARENT_NOT_FOUND", correlationId });
+                }
+                fields.push(`parent_id = $${values.length + 1}`, `level = $${values.length + 2}`);
+                values.push(parentId, (parentRes.rows[0].level ?? 1) + 1);
+            } else {
+                fields.push(`parent_id = NULL`, `level = 1`);
+            }
+        }
+
         const { rows } = await pool.query(
             `
-            update departments
-            set name = $1
+            update organizational_units
+            set ${fields.join(", ")}
             where id = $2
               and company_id = $3
               and perimeter_id = $4
-            returning id, name
+            returning id, name, parent_id, level
             `,
-            [name, departmentId, companyId, perimeterId]
+            values
         );
         if (!rows[0]) {
-            return res.status(404).json({ ok: false, error: "DEPARTMENT_NOT_FOUND", correlationId });
+            return res.status(404).json({ ok: false, error: "ORG_UNIT_NOT_FOUND", correlationId });
         }
-        return res.json({ ok: true, department: rows[0], correlationId });
+        await audit("org_unit_update", (req as any).user?.id, { orgUnitId, name, parentId }, rows[0], correlationId);
+        return res.json({ ok: true, org_unit: rows[0], correlationId });
     } catch (e: any) {
         if (String(e?.code ?? "") === "23505") {
             return res.status(409).json({
                 ok: false,
-                error: "DEPARTMENT_ALREADY_EXISTS",
-                message: "Esiste già un reparto con questo nome.",
+                error: "ORG_UNIT_ALREADY_EXISTS",
+                message: "Esiste già un'unità con questo nome.",
                 correlationId: (req as any).correlationId ?? null,
             });
         }
@@ -3061,45 +3201,112 @@ adminRouter.patch("/departments/:id", requireOperationalPerimeterAdmin, async (r
     }
 });
 
-adminRouter.delete("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+// Backward compat alias
+adminRouter.patch("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    req.params.id = req.params.id;
+    const correlationId = (req as any).correlationId;
+    const orgUnitId = String(req.params.id ?? "").trim();
+    const { companyId, perimeterId } = getTenantScope(req);
+    if (!companyId || !perimeterId) {
+        return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+    }
+    try {
+        const name = String(req.body?.name ?? "").trim();
+        if (!name) return res.status(400).json({ ok: false, error: "missing name", correlationId });
+        const { rows } = await pool.query(
+            `update organizational_units set name = $1 where id = $2 and company_id = $3 and perimeter_id = $4 returning id, name, parent_id, level`,
+            [name, orgUnitId, companyId, perimeterId]
+        );
+        if (!rows[0]) return res.status(404).json({ ok: false, error: "ORG_UNIT_NOT_FOUND", correlationId });
+        return res.json({ ok: true, department: rows[0], org_unit: rows[0], correlationId });
+    } catch (e: any) {
+        if (String(e?.code ?? "") === "23505") {
+            return res.status(409).json({ ok: false, error: "ORG_UNIT_ALREADY_EXISTS", correlationId: (req as any).correlationId ?? null });
+        }
+        next(e);
+    }
+});
+
+adminRouter.delete("/org-units/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
     try {
         const correlationId = (req as any).correlationId;
-        const departmentId = String(req.params.id ?? "").trim();
+        const orgUnitId = String(req.params.id ?? "").trim();
         const { companyId, perimeterId } = getTenantScope(req);
         if (!companyId || !perimeterId) {
             return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
         }
-        const assignedUsers = await pool.query(
-            `
-            select count(*)::int as users_count
-            from users
-            where department_id = $1
-              and company_id = $2
-              and coalesce(perimeter_id, home_perimeter_id) = $3
-            `,
-            [departmentId, companyId, perimeterId]
+
+        // Block delete if node has children
+        const childrenRes = await pool.query(
+            `select count(*)::int as cnt from organizational_units where parent_id = $1 and company_id = $2 and perimeter_id = $3`,
+            [orgUnitId, companyId, perimeterId]
         );
-        const usersCount = Number(assignedUsers.rows[0]?.users_count ?? 0);
-        if (usersCount > 0) {
+        if (Number(childrenRes.rows[0]?.cnt ?? 0) > 0) {
             return res.status(409).json({
                 ok: false,
-                error: "DEPARTMENT_HAS_USERS",
-                message: "Impossibile eliminare: ci sono utenti assegnati a questo reparto.",
+                error: "ORG_UNIT_HAS_CHILDREN",
+                message: "Impossibile eliminare: l'unità ha sotto-unità.",
+                correlationId,
+            });
+        }
+
+        // Block delete if users are assigned
+        const usersRes = await pool.query(
+            `select count(*)::int as cnt from users where org_unit_id = $1 and company_id = $2 and coalesce(perimeter_id, home_perimeter_id) = $3`,
+            [orgUnitId, companyId, perimeterId]
+        );
+        if (Number(usersRes.rows[0]?.cnt ?? 0) > 0) {
+            return res.status(409).json({
+                ok: false,
+                error: "ORG_UNIT_HAS_USERS",
+                message: "Impossibile eliminare: ci sono utenti assegnati a questa unità.",
                 correlationId,
             });
         }
 
         const del = await pool.query(
-            `
-            delete from departments
-            where id = $1
-              and company_id = $2
-              and perimeter_id = $3
-            `,
-            [departmentId, companyId, perimeterId]
+            `delete from organizational_units where id = $1 and company_id = $2 and perimeter_id = $3`,
+            [orgUnitId, companyId, perimeterId]
         );
         if ((del.rowCount ?? 0) === 0) {
-            return res.status(404).json({ ok: false, error: "DEPARTMENT_NOT_FOUND", correlationId });
+            return res.status(404).json({ ok: false, error: "ORG_UNIT_NOT_FOUND", correlationId });
+        }
+        await audit("org_unit_delete", (req as any).user?.id, { orgUnitId, companyId, perimeterId }, { deleted: 1 }, correlationId);
+        return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
+// Backward compat alias
+adminRouter.delete("/departments/:id", requireOperationalPerimeterAdmin, async (req, res, next) => {
+    try {
+        const correlationId = (req as any).correlationId;
+        const orgUnitId = String(req.params.id ?? "").trim();
+        const { companyId, perimeterId } = getTenantScope(req);
+        if (!companyId || !perimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED", correlationId });
+        }
+        const childrenRes = await pool.query(
+            `select count(*)::int as cnt from organizational_units where parent_id = $1 and company_id = $2 and perimeter_id = $3`,
+            [orgUnitId, companyId, perimeterId]
+        );
+        if (Number(childrenRes.rows[0]?.cnt ?? 0) > 0) {
+            return res.status(409).json({ ok: false, error: "ORG_UNIT_HAS_CHILDREN", correlationId });
+        }
+        const usersRes = await pool.query(
+            `select count(*)::int as cnt from users where org_unit_id = $1 and company_id = $2 and coalesce(perimeter_id, home_perimeter_id) = $3`,
+            [orgUnitId, companyId, perimeterId]
+        );
+        if (Number(usersRes.rows[0]?.cnt ?? 0) > 0) {
+            return res.status(409).json({ ok: false, error: "DEPARTMENT_HAS_USERS", correlationId });
+        }
+        const del = await pool.query(
+            `delete from organizational_units where id = $1 and company_id = $2 and perimeter_id = $3`,
+            [orgUnitId, companyId, perimeterId]
+        );
+        if ((del.rowCount ?? 0) === 0) {
+            return res.status(404).json({ ok: false, error: "ORG_UNIT_NOT_FOUND", correlationId });
         }
         return res.json({ ok: true, deleted: del.rowCount ?? 0, correlationId });
     } catch (e) {
@@ -3263,14 +3470,14 @@ function registerManagerEntityRoutes(config: ManagerEntityConfig) {
                   u.email,
                   u.role_id,
                   r.name as role_name,
-                  u.department_id,
-                  dpt.name as department_name,
+                  u.org_unit_id,
+                  ou.name as org_unit_name,
                   u.location_id,
                   l.name as location_name
                 from ${assignmentTable} a
                 join users u on u.id = a.user_id
                 left join roles r on r.id = u.role_id
-                left join departments dpt on dpt.id = u.department_id
+                left join organizational_units ou on ou.id = u.org_unit_id
                 left join locations l on l.id = u.location_id
                 where a.${managerIdColumn} = $1
                   and a.company_id = $2
@@ -4444,21 +4651,21 @@ adminRouter.get("/campaigns/:campaignId", requireOperationalPerimeterAdmin, asyn
               cand.full_name as candidate_full_name,
               cand_role.name as candidate_role_name,
               cand_loc.name as candidate_location_name,
-              cand_dept.name as candidate_department_name,
+              cand_ou.name as candidate_org_unit_name,
               tgt.full_name as target_full_name,
               tgt_role.name as target_role_name,
               tgt_loc.name as target_location_name,
-              tgt_dept.name as target_department_name
+              tgt_ou.name as target_org_unit_name
             FROM campaign_applications_snapshot cas
             LEFT JOIN positions p ON p.id = cas.position_id
             LEFT JOIN users cand ON cand.id = cas.user_id
             LEFT JOIN roles cand_role ON cand_role.id = cand.role_id
             LEFT JOIN locations cand_loc ON cand_loc.id = cand.location_id
-            LEFT JOIN departments cand_dept ON cand_dept.id = cand.department_id
+            LEFT JOIN organizational_units cand_ou ON cand_ou.id = cand.org_unit_id
             LEFT JOIN users tgt ON tgt.id = cas.target_user_id
             LEFT JOIN roles tgt_role ON tgt_role.id = tgt.role_id
             LEFT JOIN locations tgt_loc ON tgt_loc.id = tgt.location_id
-            LEFT JOIN departments tgt_dept ON tgt_dept.id = tgt.department_id
+            LEFT JOIN organizational_units tgt_ou ON tgt_ou.id = tgt.org_unit_id
             WHERE cas.campaign_id = $1
               AND cas.company_id = $2
               AND cas.perimeter_id = $3

@@ -231,8 +231,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         roles:role_id (
           name
         ),
-        department_id,
-        departments:department_id (
+        org_unit_id,
+        organizational_units:org_unit_id (
           name
         ),
         location_id,
@@ -266,8 +266,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                         group_key: string;
                         role_id: string;
                         role_name: string;
-                        department_id: string | null;
-                        department_name: string | null;
+                        org_unit_id: string | null;
+                        org_unit_name: string | null;
                         fixed_location: boolean;
                         applied: boolean;
                         priority: number | null;
@@ -293,12 +293,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
 
             const roleId = (u as any).role_id ?? "unknown";
             const roleName = (u as any).roles?.name ?? "—";
-            const departmentId = (u as any).department_id ?? null;
-            const departmentObj = Array.isArray((u as any).departments)
-                ? (u as any).departments[0]
-                : (u as any).departments;
-            const departmentName = departmentObj?.name ?? null;
-            const groupKey = `${roleId}__${departmentId ?? "null"}`;
+            const orgUnitId = (u as any).org_unit_id ?? null;
+            const orgUnitObj = Array.isArray((u as any).organizational_units)
+                ? (u as any).organizational_units[0]
+                : (u as any).organizational_units;
+            const orgUnitName = orgUnitObj?.name ?? null;
+            const groupKey = `${roleId}__${orgUnitId ?? "null"}`;
 
             // Regola business: nascondi posizioni con stesso ruolo + stessa sede del viewer.
             if (
@@ -327,8 +327,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                     group_key: groupKey,
                     role_id: roleId,
                     role_name: roleName,
-                    department_id: departmentId,
-                    department_name: departmentName,
+                    org_unit_id: orgUnitId,
+                    org_unit_name: orgUnitName,
                     fixed_location: isFixed,
                     applied: false,
                     priority: null,

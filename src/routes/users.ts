@@ -107,14 +107,14 @@ usersRouter.get("/me", async (req: Request, res: Response, next: NextFunction) =
              u.home_perimeter_id,
              l.name as location_name,
              r.name as role_name,
-             u.department_id,
-             dpt.name as department_name,
+             u.org_unit_id,
+             ou.name as org_unit_name,
              c.name as company_name,
              p.name as perimeter_name
            from users u
            left join locations l on l.id = u.location_id
            left join roles r on r.id = u.role_id
-           left join departments dpt on dpt.id = u.department_id
+           left join organizational_units ou on ou.id = u.org_unit_id
            left join companies c on c.id = $2
            left join perimeters p on p.id = $3
            where u.id = $1
@@ -191,8 +191,8 @@ usersRouter.get("/me/applications", async (req, res, next) => {
 
         r.name as occ_role_name,
         l.name as occ_location_name,
-        ou.department_id as target_department_id,
-        dpt.name as target_department_name,
+        ou.org_unit_id as target_org_unit_id,
+        org_ou.name as target_org_unit_name,
         coalesce(
           (
             select json_agg(
@@ -227,7 +227,7 @@ usersRouter.get("/me/applications", async (req, res, next) => {
       left join users ou on ou.id = p.occupied_by
       left join roles r on r.id = ou.role_id
       left join locations l on l.id = ou.location_id
-      left join departments dpt on dpt.id = ou.department_id
+      left join organizational_units org_ou on org_ou.id = ou.org_unit_id
       where a.user_id = $1
         and a.company_id = $2
         and a.perimeter_id = $3
@@ -243,8 +243,8 @@ usersRouter.get("/me/applications", async (req, res, next) => {
             position_id: r.position_id,
             priority: r.priority,
             created_at: r.created_at,
-            target_department_id: r.target_department_id ?? null,
-            target_department_name: r.target_department_name ?? null,
+            target_org_unit_id: r.target_org_unit_id ?? null,
+            target_org_unit_name: r.target_org_unit_name ?? null,
             target_responsabili: Array.isArray(r.target_responsabili) ? r.target_responsabili : [],
             target_hr_managers: Array.isArray(r.target_hr_managers) ? r.target_hr_managers : [],
             positions: {
@@ -255,8 +255,8 @@ usersRouter.get("/me/applications", async (req, res, next) => {
                         id: r.occ_user_id,
                         full_name: r.occ_full_name,
                         fixed_location: r.occ_fixed_location,
-                        department_id: r.target_department_id ?? null,
-                        department_name: r.target_department_name ?? null,
+                        org_unit_id: r.target_org_unit_id ?? null,
+                        org_unit_name: r.target_org_unit_name ?? null,
                         target_responsabili: Array.isArray(r.target_responsabili) ? r.target_responsabili : [],
                         target_hr_managers: Array.isArray(r.target_hr_managers) ? r.target_hr_managers : [],
                         roles: { name: r.occ_role_name ?? "—" },

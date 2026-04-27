@@ -22,8 +22,37 @@ publicRouter.get("/locations", async (_req, res, next) => {
 });
 
 /**
- * GET /api/public/departments
+ * GET /api/public/org-units
+ * Hierarchical org units (flat list with parent_id) for current perimeter.
  * Authenticated users within current perimeter context.
+ */
+publicRouter.get("/org-units", requireAuth, attachAccessContext, requirePerimeterAccess, async (req, res, next) => {
+    try {
+        const access = (req as AuthedRequest).accessContext;
+        if (!access?.currentCompanyId || !access?.currentPerimeterId) {
+            return res.status(400).json({ ok: false, error: "PERIMETER_CONTEXT_REQUIRED" });
+        }
+
+        const { rows } = await pool.query(
+            `
+            select ou.id, ou.name, ou.parent_id, ou.level
+            from organizational_units ou
+            where ou.company_id = $1
+              and ou.perimeter_id = $2
+            order by ou.level asc, ou.name asc
+            `,
+            [access.currentCompanyId, access.currentPerimeterId]
+        );
+
+        return res.json({ ok: true, org_units: rows, correlationId: (req as any).correlationId ?? null });
+    } catch (e) {
+        next(e);
+    }
+});
+
+/**
+ * GET /api/public/departments
+ * Backward compat alias for /api/public/org-units.
  */
 publicRouter.get("/departments", requireAuth, attachAccessContext, requirePerimeterAccess, async (req, res, next) => {
     try {
@@ -34,16 +63,16 @@ publicRouter.get("/departments", requireAuth, attachAccessContext, requirePerime
 
         const { rows } = await pool.query(
             `
-            select d.id, d.name
-            from departments d
-            where d.company_id = $1
-              and d.perimeter_id = $2
-            order by d.name asc
+            select ou.id, ou.name, ou.parent_id, ou.level
+            from organizational_units ou
+            where ou.company_id = $1
+              and ou.perimeter_id = $2
+            order by ou.level asc, ou.name asc
             `,
             [access.currentCompanyId, access.currentPerimeterId]
         );
 
-        return res.json({ ok: true, departments: rows, correlationId: (req as any).correlationId ?? null });
+        return res.json({ ok: true, departments: rows, org_units: rows, correlationId: (req as any).correlationId ?? null });
     } catch (e) {
         next(e);
     }

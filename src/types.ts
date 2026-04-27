@@ -39,15 +39,20 @@ export type CampaignApplicationsSnapshotRow = {
   snapshot_at: string;
 };
 
-// ─── departments ──────────────────────────────────────────────────────────────
+// ─── organizational_units ─────────────────────────────────────────────────────
 
-export type DepartmentRow = {
+export type OrgUnitRow = {
   id: string;
+  name: string;
+  parent_id: string | null;
+  level: number;
   company_id: string;
   perimeter_id: string;
-  name: string;
   created_at: string;
 };
+
+/** @deprecated use OrgUnitRow */
+export type DepartmentRow = OrgUnitRow;
 
 // ─── hr_managers ──────────────────────────────────────────────────────────────
 
@@ -92,7 +97,7 @@ export type UserResponsabileAssignmentRow = {
 };
 
 // ─── users (updated) ──────────────────────────────────────────────────────────
-// Canonical shape of a users row. department_id added in RC3 Sprint 1.
+// Canonical shape of a users row. org_unit_id added RC3 (replaces department_id).
 
 export type UserRow = {
   id: string;
@@ -100,6 +105,8 @@ export type UserRow = {
   full_name: string | null;
   role_id: string | null;
   location_id: string | null;
+  org_unit_id: string | null;
+  /** @deprecated use org_unit_id */
   department_id: string | null;
   company_id: string | null;
   perimeter_id: string | null;
