@@ -32,7 +32,7 @@ async function countDistinctGroupsInPerimeter(userId, companyId, perimeterId, ca
         return 0;
     const { data: users, error: usersErr } = await supabaseAdmin
         .from("users")
-        .select("id, role_id, location_id, department_id")
+        .select("id, role_id, location_id, org_unit_id")
         .in("id", occupantIds)
         .eq("company_id", companyId);
     if (usersErr)
@@ -69,7 +69,11 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
     try {
         const access = r.accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
-            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", message: "perimeter context required" });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
         const companyId = access.currentCompanyId;
         const perimeterId = access.currentPerimeterId;
@@ -88,14 +92,16 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         const lifecycle = await getCampaignStatus(companyId, perimeterId);
         if (lifecycle.campaign_status !== "open") {
             return res.status(403).json({
-                error: "CAMPAIGN_CLOSED",
-                message: "La campagna di mobilità non è aperta",
+                ok: false,
+                error: { code: "CAMPAIGN_CLOSED", message: "La campagna di mobilità non è aperta" },
+                correlationId,
             });
         }
         if (!lifecycle.campaign_id) {
             return res.status(409).json({
-                error: "CAMPAIGN_ID_MISSING",
-                message: "Nessuna campagna attiva per il perimetro corrente",
+                ok: false,
+                error: { code: "CAMPAIGN_ID_MISSING", message: "Nessuna campagna attiva per il perimetro corrente" },
+                correlationId,
             });
         }
         const activeCampaignId = lifecycle.campaign_id;
@@ -134,9 +140,9 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         }
         // Regola prodotto: una priority non può essere usata più di una volta dallo stesso utente,
         // a meno che le righe esistenti appartengano allo stesso gruppo
-        // (role_id, location_id, department_id)
+        // (role_id, location_id, org_unit_id)
         // delle positionIds in arrivo (stessa candidatura logica, nuovi occupanti).
-        // role_id/location_id/department_id risiedono su users (tramite occupied_by su positions).
+        // role_id/location_id/org_unit_id risiedono su users (tramite occupied_by su positions).
         // Incoming: resolve role+location via occupant
         const { data: incomingPos, error: inPosErr } = await supabaseAdmin
             .from("positions")
@@ -149,12 +155,12 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
         const incomingOccupantIds = (incomingPos ?? []).map((p) => p.occupied_by).filter(Boolean);
         const { data: incomingUsers, error: inUsersErr } = await supabaseAdmin
             .from("users")
-            .select("id, role_id, location_id, department_id")
+            .select("id, role_id, location_id, org_unit_id")
             .in("id", incomingOccupantIds)
             .eq("company_id", companyId);
         if (inUsersErr)
             throw inUsersErr;
-        const incomingGroups = new Set((incomingUsers ?? []).map((u) => `${u.role_id}__${u.location_id}__${u.department_id}`));
+        const incomingGroups = new Set((incomingUsers ?? []).map((u) => `${u.role_id}__${u.location_id}__${u.org_unit_id}`));
         // Existing: what positions already use this priority?
         const { data: used, error: usedErr } = await supabaseAdmin
             .from("applications")
@@ -180,12 +186,12 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             const usedOccupantIds = (usedPos ?? []).map((p) => p.occupied_by).filter(Boolean);
             const { data: usedUsers, error: uuErr } = await supabaseAdmin
                 .from("users")
-                .select("id, role_id, location_id, department_id")
+                .select("id, role_id, location_id, org_unit_id")
                 .in("id", usedOccupantIds)
                 .eq("company_id", companyId);
             if (uuErr)
                 throw uuErr;
-            existingConflict = (usedUsers ?? []).some((u) => !incomingGroups.has(`${u.role_id}__${u.location_id}__${u.department_id}`));
+            existingConflict = (usedUsers ?? []).some((u) => !incomingGroups.has(`${u.role_id}__${u.location_id}__${u.org_unit_id}`));
         }
         if (existingConflict) {
             return res.status(400).json({
@@ -219,12 +225,22 @@ applicationsRouter.post("/users/:userId/applications/bulk", requireAuth, async (
             .eq("id", targetUserId)
             .eq("company_id", companyId)
             .eq("perimeter_id", perimeterId);
-        await audit("applications_bulk_apply", r.user.id, { targetUserId, priority, positionIdsCount: positionIds.length }, { inserted: rows.length, application_count: distinctCount, campaign_id: activeCampaignId }, correlationId);
-        return res.status(200).json({ ok: true, inserted: rows.length });
+        await audit("applications_bulk_apply", r.user.id, {
+            targetUserId,
+            priority,
+            positionIdsCount: positionIds.length,
+            company_id: companyId,
+            perimeter_id: perimeterId,
+        }, { inserted: rows.length, application_count: distinctCount, campaign_id: activeCampaignId }, correlationId, { companyId, perimeterId });
+        return res.status(200).json({ ok: true, inserted: rows.length, correlationId });
     }
     catch (err) {
         console.error("❌ applications bulk insert error", err);
-        return res.status(500).json({ error: "APPLICATIONS_BULK_INSERT_FAILED" });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "APPLICATIONS_BULK_INSERT_FAILED", message: String(err?.message ?? err) },
+            correlationId,
+        });
     }
 });
 /**
@@ -245,21 +261,27 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
     try {
         const access = r.accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
-            return res.status(400).json({ error: "PERIMETER_CONTEXT_REQUIRED", message: "perimeter context required" });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
         const companyId = access.currentCompanyId;
         const perimeterId = access.currentPerimeterId;
         const lifecycle = await getCampaignStatus(companyId, perimeterId);
         if (lifecycle.campaign_status !== "open") {
             return res.status(403).json({
-                error: "CAMPAIGN_CLOSED",
-                message: "La campagna di mobilità non è aperta",
+                ok: false,
+                error: { code: "CAMPAIGN_CLOSED", message: "La campagna di mobilità non è aperta" },
+                correlationId,
             });
         }
         if (!lifecycle.campaign_id) {
             return res.status(409).json({
-                error: "CAMPAIGN_ID_MISSING",
-                message: "Nessuna campagna attiva per il perimetro corrente",
+                ok: false,
+                error: { code: "CAMPAIGN_ID_MISSING", message: "Nessuna campagna attiva per il perimetro corrente" },
+                correlationId,
             });
         }
         const activeCampaignId = lifecycle.campaign_id;
@@ -303,13 +325,34 @@ applicationsRouter.delete("/users/:userId/applications/bulk", requireAuth, async
             .eq("id", targetUserId)
             .eq("company_id", companyId)
             .eq("perimeter_id", perimeterId);
-        await audit("applications_bulk_withdraw", r.user.id, { targetUserId, positionIdsCount: positionIds.length }, { application_count: distinctCount, campaign_id: activeCampaignId }, correlationId);
-        return res.status(200).json({ ok: true, deleted: true, application_count: distinctCount });
+        await audit("applications_bulk_withdraw", r.user.id, {
+            targetUserId,
+            positionIdsCount: positionIds.length,
+            company_id: companyId,
+            perimeter_id: perimeterId,
+        }, { application_count: distinctCount, campaign_id: activeCampaignId }, correlationId, { companyId, perimeterId });
+        return res.status(200).json({
+            ok: true,
+            deleted: true,
+            application_count: distinctCount,
+            correlationId,
+        });
     }
     catch (err) {
         console.error("❌ applications bulk delete error", err);
-        await audit("applications_bulk_withdraw", r.user.id, { targetUserId }, { error: String(err?.message ?? err) }, correlationId);
-        return res.status(500).json({ error: "APPLICATIONS_BULK_DELETE_FAILED" });
+        await audit("applications_bulk_withdraw", r.user.id, {
+            targetUserId,
+            company_id: r.accessContext?.currentCompanyId ?? null,
+            perimeter_id: r.accessContext?.currentPerimeterId ?? null,
+        }, { error: String(err?.message ?? err) }, correlationId, {
+            companyId: r.accessContext?.currentCompanyId ?? null,
+            perimeterId: r.accessContext?.currentPerimeterId ?? null,
+        });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "APPLICATIONS_BULK_DELETE_FAILED", message: String(err?.message ?? err) },
+            correlationId,
+        });
     }
 });
 //# sourceMappingURL=applications.js.map

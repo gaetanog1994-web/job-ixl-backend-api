@@ -23,11 +23,18 @@ graphProxyRouter.use(async (req, res) => {
                 correlationId,
             });
         }
-        const base = GRAPH_SERVICE_URL.replace(/\/+$/, "");
+        const baseUrl = new URL(GRAPH_SERVICE_URL);
+        const graphServiceOrigin = `${baseUrl.protocol}//${baseUrl.host}`;
+        const basePath = baseUrl.pathname.replace(/\/+$/, "");
         let forwardPath = req.originalUrl.replace(/^\/api\/admin\/graph/, "") || "/";
+        if (forwardPath === "/chains")
+            forwardPath = "/graph/chains";
+        if (forwardPath === "/summary")
+            forwardPath = "/graph/summary";
         if (forwardPath === "/warmup")
             forwardPath = "/neo4j/warmup";
-        const targetUrl = new URL(`${base}${forwardPath}`);
+        const withBasePath = `${basePath}${forwardPath}`.replace(/\/{2,}/g, "/");
+        const targetUrl = new URL(withBasePath, `${graphServiceOrigin}/`);
         const isCriticalGraphOperation = forwardPath === "/neo4j/warmup" ||
             forwardPath === "/graph/chains" ||
             forwardPath === "/graph/summary" ||
@@ -75,11 +82,34 @@ graphProxyRouter.use(async (req, res) => {
         }
         // 1) prima prova
         let resp = await doFetch(targetUrl);
-        // 2) fallback /api se 404 (utile per future routes)
-        if (resp.status === 404 && !forwardPath.startsWith("/api/")) {
-            const fallback = new URL(`${base}/api${forwardPath}`);
-            fallback.search = targetUrl.search;
-            resp = await doFetch(fallback);
+        // 2) fallback compatibilità path prefix (/api) e root paths
+        if (resp.status === 404) {
+            const fallbackCandidates = [];
+            const rootPath = `${forwardPath}`.replace(/\/{2,}/g, "/");
+            const rootApiPath = `/api${forwardPath}`.replace(/\/{2,}/g, "/");
+            const scopedRootPath = `${basePath}${forwardPath}`.replace(/\/{2,}/g, "/");
+            const scopedApiPath = `${basePath}/api${forwardPath}`.replace(/\/{2,}/g, "/");
+            // Probe order:
+            // 1) root path (graph-service standard)
+            // 2) root + /api prefix
+            // 3) scoped base path
+            // 4) scoped base path + /api prefix
+            fallbackCandidates.push(new URL(rootPath, `${graphServiceOrigin}/`));
+            if (!forwardPath.startsWith("/api/")) {
+                fallbackCandidates.push(new URL(rootApiPath, `${graphServiceOrigin}/`));
+            }
+            if (scopedRootPath !== rootPath) {
+                fallbackCandidates.push(new URL(scopedRootPath, `${graphServiceOrigin}/`));
+            }
+            if (!forwardPath.startsWith("/api/") && scopedApiPath !== rootApiPath) {
+                fallbackCandidates.push(new URL(scopedApiPath, `${graphServiceOrigin}/`));
+            }
+            for (const fallback of fallbackCandidates) {
+                fallback.search = targetUrl.search;
+                resp = await doFetch(fallback);
+                if (resp.status !== 404)
+                    break;
+            }
         }
         const text = await resp.text();
         let parsedBody = null;
@@ -99,7 +129,10 @@ graphProxyRouter.use(async (req, res) => {
                 ok: resp.ok,
                 status: resp.status,
                 graphStatus: parsedBody?.status ?? null,
-            }, correlationId);
+            }, correlationId, {
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            });
         }
         if (!resp.ok && resp.status >= 500) {
             const failure = classifyGraphFailure(resp.status, parsedBody);

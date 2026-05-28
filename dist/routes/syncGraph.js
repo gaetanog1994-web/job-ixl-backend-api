@@ -32,13 +32,17 @@ syncGraphRouter.post("/", async (req, res) => {
     try {
         const access = req.accessContext;
         if (!access?.currentCompanyId || !access?.currentPerimeterId) {
-            return res.status(400).json({ error: "Perimeter context required", correlationId });
+            return res.status(400).json({
+                ok: false,
+                error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
+                correlationId,
+            });
         }
         const campaignId = String(req.body?.campaign_id ?? "").trim();
         if (!campaignId) {
             return res.status(400).json({
-                error: "CAMPAIGN_ID_REQUIRED",
-                message: "campaign_id is required",
+                ok: false,
+                error: { code: "CAMPAIGN_ID_REQUIRED", message: "campaign_id is required" },
                 correlationId,
             });
         }
@@ -63,8 +67,11 @@ syncGraphRouter.post("/", async (req, res) => {
         }
         if (!campaign?.id) {
             return res.status(404).json({
-                error: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
-                message: "Campaign not found in scope or not closed",
+                ok: false,
+                error: {
+                    code: "CAMPAIGN_NOT_FOUND_OR_NOT_CLOSED",
+                    message: "Campaign not found in scope or not closed",
+                },
                 correlationId,
             });
         }
@@ -190,7 +197,10 @@ syncGraphRouter.post("/", async (req, res) => {
                 ok: false,
                 code: failure.code,
                 upstreamStatus: buildRes.status,
-            }, correlationId);
+            }, correlationId, {
+                companyId: access.currentCompanyId,
+                perimeterId: access.currentPerimeterId,
+            });
             return res.status(mappedStatus).json({
                 error: failure.code,
                 message: failure.code === "GRAPH_WARMUP_WAIT"
@@ -211,7 +221,10 @@ syncGraphRouter.post("/", async (req, res) => {
             edgesBuilt: edges.length,
             usersMapped: Object.keys(usersById).length,
             upstreamStatus: buildRes.status,
-        }, correlationId);
+        }, correlationId, {
+            companyId: access.currentCompanyId,
+            perimeterId: access.currentPerimeterId,
+        });
         return res.status(200).json({
             ok: true,
             correlationId,
@@ -235,7 +248,11 @@ syncGraphRouter.post("/", async (req, res) => {
             operation: "sync_graph_rebuild",
         });
         await audit("graph_sync_rebuild", actorId, {}, { ok: false, error: e?.message ?? String(e) }, correlationId);
-        return res.status(500).json({ error: e?.message ?? String(e), correlationId });
+        return res.status(500).json({
+            ok: false,
+            error: { code: "GRAPH_SYNC_UNHANDLED", message: e?.message ?? String(e) },
+            correlationId,
+        });
     }
 });
 //# sourceMappingURL=syncGraph.js.map

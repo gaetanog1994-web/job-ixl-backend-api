@@ -199,8 +199,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
         roles:role_id (
           name
         ),
-        department_id,
-        departments:department_id (
+        org_unit_id,
+        organizational_units:org_unit_id (
           name
         ),
         location_id,
@@ -235,12 +235,12 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                 continue;
             const roleId = u.role_id ?? "unknown";
             const roleName = u.roles?.name ?? "—";
-            const departmentId = u.department_id ?? null;
-            const departmentObj = Array.isArray(u.departments)
-                ? u.departments[0]
-                : u.departments;
-            const departmentName = departmentObj?.name ?? null;
-            const groupKey = `${roleId}__${departmentId ?? "null"}`;
+            const orgUnitId = u.org_unit_id ?? null;
+            const orgUnitObj = Array.isArray(u.organizational_units)
+                ? u.organizational_units[0]
+                : u.organizational_units;
+            const orgUnitName = orgUnitObj?.name ?? null;
+            const groupKey = `${roleId}__${orgUnitId ?? "null"}`;
             // Regola business: nascondi posizioni con stesso ruolo + stessa sede del viewer.
             if (me?.role_id &&
                 me?.location_id &&
@@ -263,8 +263,8 @@ mapRouter.get("/positions", requireAuth, async (req, res) => {
                     group_key: groupKey,
                     role_id: roleId,
                     role_name: roleName,
-                    department_id: departmentId,
-                    department_name: departmentName,
+                    org_unit_id: orgUnitId,
+                    org_unit_name: orgUnitName,
                     fixed_location: isFixed,
                     applied: false,
                     priority: null,
