@@ -24,6 +24,7 @@ import {
     requireTenantScope,
 } from "./tenant.js";
 import { buildOpenApiSpec } from "./openapi.js";
+import { startKeepAlive } from "./keepAlive.js";
 
 const app = express();
 
@@ -61,6 +62,7 @@ function sendError(
 app.set("trust proxy", 1);
 
 logInfo("backend_boot", null, { version: "BETA5" });
+startKeepAlive();
 
 /**
  * CORS

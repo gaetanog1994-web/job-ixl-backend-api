@@ -3843,6 +3843,40 @@ adminRouter.post("/locations", async (req, res, next) => {
     }
 });
 
+adminRouter.patch("/locations/:id", async (req, res, next) => {
+    try {
+        const r = req as unknown as AuthedRequest;
+        const correlationId = (req as any).correlationId ?? null;
+        const id = req.params.id;
+        const { name, latitude, longitude } = req.body ?? {};
+
+        if (name === undefined && latitude === undefined && longitude === undefined) {
+            return res.status(400).json({ ok: false, error: "missing fields — at least one of name, latitude, longitude required", correlationId });
+        }
+
+        const setClauses: string[] = [];
+        const params: unknown[] = [id];
+        if (name !== undefined) { params.push(String(name)); setClauses.push(`name = $${params.length}`); }
+        if (latitude !== undefined) { params.push(latitude); setClauses.push(`latitude = $${params.length}`); }
+        if (longitude !== undefined) { params.push(longitude); setClauses.push(`longitude = $${params.length}`); }
+
+        const { rows } = await pool.query(
+            `update locations set ${setClauses.join(", ")} where id = $1 returning id, name, latitude, longitude`,
+            params
+        );
+
+        if (!rows[0]) {
+            return res.status(404).json({ ok: false, error: "NOT_FOUND", message: "Location not found", correlationId });
+        }
+
+        invalidateMapCache();
+        await audit("location_update", r.user.id, { id, name, latitude, longitude }, { location: rows[0] }, correlationId);
+        return res.json({ ok: true, location: rows[0], correlationId });
+    } catch (e) {
+        next(e);
+    }
+});
+
 adminRouter.delete("/locations/:id", async (req, res, next) => {
     try {
         const id = req.params.id;
