@@ -294,40 +294,44 @@ usersRouter.post("/me/deactivate", async (req, res) => {
 usersRouter.post("/me/reservation", async (req, res) => {
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
-    const companyId = r.accessContext?.currentCompanyId ?? null;
-    const perimeterId = r.accessContext?.currentPerimeterId ?? null;
-
-    if (!companyId || !perimeterId) {
-        return res.status(400).json({
-            ok: false,
-            error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
-            correlationId,
-        });
-    }
 
     try {
         const out = await withTx(async (client) => {
-            const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
-
-            const userRes = await client.query<{ is_reserved: boolean; availability_status: string }>(
+            // Fetch user by ID only — use their home perimeter for lifecycle check,
+            // not the request context (user may be browsing a different perimeter).
+            const userRes = await client.query<{
+                is_reserved: boolean;
+                availability_status: string;
+                company_id: string | null;
+                effective_perimeter_id: string | null;
+            }>(
                 `
-                select is_reserved, availability_status
+                select is_reserved, availability_status, company_id,
+                       coalesce(perimeter_id, home_perimeter_id) as effective_perimeter_id
                 from users
                 where id = $1
-                  and company_id = $2
-                  and coalesce(perimeter_id, home_perimeter_id) = $3
                 limit 1
                 `,
-                [r.user.id, companyId, perimeterId]
+                [r.user.id]
             );
             if (!userRes.rows.length) {
                 return { missingUser: true as const };
             }
 
+            const userRow = userRes.rows[0];
+            const companyId = userRow.company_id;
+            const perimeterId = userRow.effective_perimeter_id;
+
+            if (!companyId || !perimeterId) {
+                return { missingUser: true as const };
+            }
+
+            const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
+
             const invalid = validateUserReservationAction({
                 lifecycle,
                 action: "reserve",
-                isReserved: Boolean(userRes.rows[0].is_reserved),
+                isReserved: Boolean(userRow.is_reserved),
             });
             if (invalid) return { invalid } as const;
 
@@ -338,11 +342,9 @@ usersRouter.post("/me/reservation", async (req, res) => {
                     availability_status = 'inactive',
                     show_position = false
                 where id = $1
-                  and company_id = $2
-                  and coalesce(perimeter_id, home_perimeter_id) = $3
                 returning availability_status, is_reserved
                 `,
-                [r.user.id, companyId, perimeterId]
+                [r.user.id]
             );
 
             return {
@@ -352,6 +354,8 @@ usersRouter.post("/me/reservation", async (req, res) => {
                 }),
                 campaign_status: lifecycle.campaignStatus,
                 reservations_status: lifecycle.reservationsStatus,
+                _companyId: companyId,
+                _perimeterId: perimeterId,
             };
         });
 
@@ -363,24 +367,24 @@ usersRouter.post("/me/reservation", async (req, res) => {
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
         }
 
+        const { _companyId, _perimeterId, ...outPublic } = out as any;
         invalidateMapCache();
         await audit(
             "user_reserve_for_campaign",
             r.user.id,
-            { company_id: companyId, perimeter_id: perimeterId },
-            out,
+            { company_id: _companyId, perimeter_id: _perimeterId },
+            outPublic,
             correlationId,
-            { companyId, perimeterId }
+            { companyId: _companyId, perimeterId: _perimeterId }
         );
-        return res.status(200).json({ ok: true, ...out, correlationId });
+        return res.status(200).json({ ok: true, ...outPublic, correlationId });
     } catch (e: any) {
         await audit(
             "user_reserve_for_campaign",
             r.user.id,
-            { company_id: companyId, perimeter_id: perimeterId },
+            {},
             { error: String(e?.message ?? e) },
             correlationId,
-            { companyId, perimeterId }
         );
         return res.status(500).json({
             ok: false,
@@ -397,40 +401,44 @@ usersRouter.post("/me/reservation", async (req, res) => {
 usersRouter.delete("/me/reservation", async (req, res) => {
     const r = req as AuthedRequest;
     const correlationId = (req as any).correlationId;
-    const companyId = r.accessContext?.currentCompanyId ?? null;
-    const perimeterId = r.accessContext?.currentPerimeterId ?? null;
-
-    if (!companyId || !perimeterId) {
-        return res.status(400).json({
-            ok: false,
-            error: { code: "PERIMETER_CONTEXT_REQUIRED", message: "Perimeter context required" },
-            correlationId,
-        });
-    }
 
     try {
         const out = await withTx(async (client) => {
-            const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
-
-            const userRes = await client.query<{ is_reserved: boolean; availability_status: string }>(
+            // Fetch user by ID only — use their home perimeter for lifecycle check,
+            // not the request context (user may be browsing a different perimeter).
+            const userRes = await client.query<{
+                is_reserved: boolean;
+                availability_status: string;
+                company_id: string | null;
+                effective_perimeter_id: string | null;
+            }>(
                 `
-                select is_reserved, availability_status
+                select is_reserved, availability_status, company_id,
+                       coalesce(perimeter_id, home_perimeter_id) as effective_perimeter_id
                 from users
                 where id = $1
-                  and company_id = $2
-                  and coalesce(perimeter_id, home_perimeter_id) = $3
                 limit 1
                 `,
-                [r.user.id, companyId, perimeterId]
+                [r.user.id]
             );
             if (!userRes.rows.length) {
                 return { missingUser: true as const };
             }
 
+            const userRow = userRes.rows[0];
+            const companyId = userRow.company_id;
+            const perimeterId = userRow.effective_perimeter_id;
+
+            if (!companyId || !perimeterId) {
+                return { missingUser: true as const };
+            }
+
+            const lifecycle = await loadCampaignLifecycle(client, companyId, perimeterId, { forUpdate: true });
+
             const invalid = validateUserReservationAction({
                 lifecycle,
                 action: "unreserve",
-                isReserved: Boolean(userRes.rows[0].is_reserved),
+                isReserved: Boolean(userRow.is_reserved),
             });
             if (invalid) return { invalid } as const;
 
@@ -441,11 +449,9 @@ usersRouter.delete("/me/reservation", async (req, res) => {
                     availability_status = 'inactive',
                     show_position = false
                 where id = $1
-                  and company_id = $2
-                  and coalesce(perimeter_id, home_perimeter_id) = $3
                 returning availability_status, is_reserved
                 `,
-                [r.user.id, companyId, perimeterId]
+                [r.user.id]
             );
 
             return {
@@ -455,6 +461,8 @@ usersRouter.delete("/me/reservation", async (req, res) => {
                 }),
                 campaign_status: lifecycle.campaignStatus,
                 reservations_status: lifecycle.reservationsStatus,
+                _companyId: companyId,
+                _perimeterId: perimeterId,
             };
         });
 
@@ -466,24 +474,24 @@ usersRouter.delete("/me/reservation", async (req, res) => {
             return res.status(invalid.status).json({ ok: false, code: invalid.code, error: invalid.message, correlationId });
         }
 
+        const { _companyId, _perimeterId, ...outPublic } = out as any;
         invalidateMapCache();
         await audit(
             "user_unreserve_for_campaign",
             r.user.id,
-            { company_id: companyId, perimeter_id: perimeterId },
-            out,
+            { company_id: _companyId, perimeter_id: _perimeterId },
+            outPublic,
             correlationId,
-            { companyId, perimeterId }
+            { companyId: _companyId, perimeterId: _perimeterId }
         );
-        return res.status(200).json({ ok: true, ...out, correlationId });
+        return res.status(200).json({ ok: true, ...outPublic, correlationId });
     } catch (e: any) {
         await audit(
             "user_unreserve_for_campaign",
             r.user.id,
-            { company_id: companyId, perimeter_id: perimeterId },
+            {},
             { error: String(e?.message ?? e) },
             correlationId,
-            { companyId, perimeterId }
         );
         return res.status(500).json({
             ok: false,
