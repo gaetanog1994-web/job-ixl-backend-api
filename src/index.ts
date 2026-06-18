@@ -252,22 +252,14 @@ if (ENABLE_DEBUG_ENDPOINTS) {
     app.use("/api/docs", swaggerUi.serve, swaggerUi.setup(openApiSpec));
 }
 
-// Rate limit — admin (60 req/min per user/IP)
+// Rate limit — admin (200 req/min per user/IP — single-user panel with parallel reads)
 const adminLimiter = rateLimit({
     windowMs: 60_000,
-    max: 60,
+    max: 200,
     standardHeaders: true,
     legacyHeaders: false,
     keyGenerator: (req) => {
-        const key = (req as any).user?.id ?? req.ip;
-        console.log("ADMIN_LIMIT_KEY", {
-            path: req.originalUrl,
-            method: req.method,
-            userId: (req as any).user?.id ?? null,
-            ip: req.ip,
-            key,
-        });
-        return key;
+        return (req as any).user?.id ?? req.ip;
     },
     handler: (req, res, _next, options) => {
         console.error("ADMIN_RATE_LIMIT_HIT", {
